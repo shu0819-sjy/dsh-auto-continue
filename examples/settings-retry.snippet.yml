@@ -1,0 +1,31 @@
+# 上游 provider 超时 + 重试样例。
+# 合并进 <DSH_HOME>/settings.yaml 的 llm-pi-ai.providers.<名字> 块。
+# 本机常见形态是 JSON-in-YAML（花括号对象）；下列纯 YAML 等价，按你的文件风格粘贴即可。
+# API 密钥请走 Web UI 凭据页，不要写进本文件。
+
+llm-pi-ai:
+  providers:
+    your-provider:
+      displayName: Your Provider
+      apiKeyEnv: YOUR_PROVIDER_API_KEY
+      api: openai-completions
+      baseURL: https://api.example.com/v1
+      # 单次请求总超时（毫秒）；长输出建议 ≥ 600000
+      timeoutMs: 600000
+      # 流式空闲超时（毫秒）：多久收不到新 chunk 视为卡死
+      streamIdleTimeoutMs: 600000
+      # 可重试错误的退避策略（超时/网络/5xx 等由上游判定）
+      retryPolicy:
+        # normal = 标准重试；具体可重试集合以 DSH 实现为准
+        mode: normal
+        # 最大重试次数（不含首次）
+        maxRetries: 5
+        backoff:
+          # 首次重试前等待
+          initialDelayMs: 2000
+          # 退避上限
+          maxDelayMs: 30000
+          # 抖动比例，减轻惊群
+          jitterRatio: 0.15
+      models:
+        - id: your-model-id
