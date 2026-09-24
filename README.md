@@ -1,5 +1,7 @@
 # dsh-auto-continue
 
+[![CI](https://github.com/shu0819-sjy/dsh-auto-continue/actions/workflows/ci.yml/badge.svg)](https://github.com/shu0819-sjy/dsh-auto-continue/actions/workflows/ci.yml)
+
 DSH 轮次失败 / 复读熔断后自动续跑套件。包含 **auto-continue v1.3**（失败与软熔断后代发「继续」）与 **anti-repetition v2**（流式复读/断流熔断并广播事件）。MIT 许可。
 
 ## 特性
@@ -159,12 +161,22 @@ bash install/install.sh "$HOME/.dsh/data"
 
 ## 测试
 
-在仓库根目录（需本机可解析 `@deepseek-ai/*`，通常设置 `DSH_HOME` 或依赖 `test/_dsh-env.mjs` 探测）：
+### CI（可移植，无需 DSH）
+
+GitHub Actions 跑 `node test/ci-static.mjs`（Node 18/20/22）：语法检查 + 源码/示例契约断言，**不** import 插件（插件依赖仅存在于 DSH 安装内的 `@deepseek-ai/*`）。
 
 ```bash
-node test/test.mjs          # 25/25 Mock
-node test/integration.mjs   # 5/5 集成
-node test/check.mjs         # 11/11 静态自检
+node test/ci-static.mjs
+```
+
+### 本机全量（需 DSH / `@deepseek-ai/*`）
+
+在仓库根目录（通常设置 `DSH_HOME`，或依赖 `test/_dsh-env.mjs` 探测本机安装）：
+
+```bash
+node test/test.mjs          # 25/25 Mock（需 DSH node_modules）
+node test/integration.mjs   # 5/5 集成（需 @deepseek-ai/cordis）
+node test/check.mjs         # 11/11 静态自检（需已安装的 plugins + cordis.patch.yml）
 ```
 
 ## FAQ
