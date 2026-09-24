@@ -1,0 +1,70 @@
+# 追加到 <DSH_HOME>/profiles/web/cordis.patch.yml 末尾即可挂载两插件。
+# 下列均为各插件 schema 默认值；按需改 models / 阈值后重启 DSH 生效。
+
+# 防复刷 v2：流式检测复读/断流，并广播 anti-repetition/stopped 供 auto-continue 软续跑
+- insert:
+    - id: anti-repetition
+      name: ./plugins/anti-repetition.mjs
+      config:
+        # 流式复读检测作用的模型 id 通配；["*"] = 全部模型
+        models: ["*"]
+        # 仅对这些模型注入 frequency/presence penalty（与流式检测分离）
+        samplingModels: ["*glm-5.3-flash*", "*glm*flash*"]
+        # 连续重复次数阈值（含当前段）
+        minRepeats: 3
+        # 重复单元最短/最长字符数
+        minUnitLen: 5
+        maxUnitLen: 96
+        # 每累计多少新字符再检测一次
+        checkEveryChars: 12
+        # 检测窗口（只看末尾这么多字符）
+        windowChars: 1600
+        # 同一行连续重复阈值
+        minLineRepeats: 3
+        # 密度检测（默认关，避免技术长文误伤）
+        enableDensity: false
+        minDensityHits: 8
+        densityMinLen: 20
+        # 归一化短词干刷屏检测
+        enableNormStem: true
+        minStemHits: 12
+        minStemShare: 0.35
+        minStemLen: 3
+        maxStemLen: 24
+        # 早期崩溃：一字一行拆字 / 破损 shell 草稿
+        enableCollapseDetect: true
+        minSingleCharLines: 40
+        minSingleCharShare: 0.3
+        minBrokenShellHits: 8
+        # 低多样性检测（默认关，易误伤长思考）
+        enableUniqueRatio: false
+        minUniqueRatio: 0.12
+        uniqueMinChars: 200
+        # 命中后追加可见提示；是否监控思考链
+        appendNotice: true
+        watchReasoning: true
+        noticeText: "\n\n[anti-repetition: 检测到复读循环，已自动停止。回「继续」即可接着干。]"
+        # fetch 兜底注入 sampling penalty
+        injectSamplingParams: true
+        frequencyPenalty: 0.55
+        presencePenalty: 0.4
+
+# 失败自动续跑 v1.3：硬失败白名单退避续跑 + 软熔断（anti-repetition）后续跑
+- insert:
+    - id: auto-continue
+      name: ./plugins/auto-continue.mjs
+      config:
+        # 总开关
+        enabled: true
+        # 自动续跑时代发的文本
+        continueText: "继续"
+        # 硬失败连发上限
+        maxAttempts: 3
+        # 软熔断连发上限
+        maxRepetitionResumes: 2
+        # 是否在 anti-repetition 熔断后自动续跑
+        resumeAfterRepetitionStop: true
+        # 退避表（秒）：第 n 次续跑前等待
+        backoffSeconds: [5, 15, 30]
+        # 子 agent 失败是否也续跑（默认否，防与父级双跑）
+        includeSubagents: false
