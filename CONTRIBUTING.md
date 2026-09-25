@@ -67,6 +67,7 @@ Commit messages: conventional, imperative subject ≤ 72 chars
 | `npm run check` | `node --check` on both plugins |
 | `npm run lint` | ESLint flat config over `plugins/` + `test/` |
 | `npm run test:static` | Portable static suite (no DSH) |
+| `npm run test:mock` | Behavior suite with stubbed `@deepseek-ai/*` (no DSH) |
 | `npm run ci` | All of the above |
 
 ## Reporting issues
