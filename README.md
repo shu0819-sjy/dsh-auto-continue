@@ -1,6 +1,9 @@
 # dsh-auto-continue
 
 [![CI](https://github.com/shu0819-sjy/dsh-auto-continue/actions/workflows/ci.yml/badge.svg)](https://github.com/shu0819-sjy/dsh-auto-continue/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
+[![Node.js](https://img.shields.io/badge/node-%3E%3D18-brightgreen.svg)](https://nodejs.org/)
+[![Version](https://img.shields.io/badge/version-0.1.0-blue.svg)](./CHANGELOG.md)
 
 DSH 轮次失败 / 复读熔断后自动续跑套件。包含 **auto-continue v1.3**（失败与软熔断后代发「继续」）与 **anti-repetition v2**（流式复读/断流熔断并广播事件）。MIT 许可。
 
