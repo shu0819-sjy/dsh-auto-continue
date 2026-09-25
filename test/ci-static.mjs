@@ -7,8 +7,11 @@
  *
  * Run from repo root: node test/ci-static.mjs
  *
- * Skipped on CI (require local DSH):
- *   - test/test.mjs        Mock suite (resolve hook → DSH node_modules)
+ * Companion CI suite (also no DSH):
+ *   - test/ci-mock.mjs     Behavior tests with stubbed @deepseek-ai/* deps
+ *
+ * Still local-only (require real DSH):
+ *   - test/test.mjs        Full mock suite (resolve hook → DSH node_modules)
  *   - test/integration.mjs Real cordis Context (needs @deepseek-ai/cordis)
  *   - test/check.mjs       Installed-profile self-check (needs DSH_HOME plugins + patch)
  */
@@ -43,6 +46,8 @@ for (const rel of [
   "LICENSE",
   "README.md",
   "CHANGELOG.md",
+  "CONTRIBUTING.md",
+  "SECURITY.md",
 ]) {
   check(`tree: ${rel}`, fileExists(rel), join(root, rel));
 }

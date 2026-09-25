@@ -19,6 +19,22 @@ DSH 轮次失败 / 复读熔断后自动续跑套件。包含 **auto-continue v1
 
 ## 工作原理
 
+### 插件机制（挂载 / 事件总线 / 双链熔断）
+
+1. **挂载**：`install/*.ps1|sh`（或手动）把 `plugins/*.mjs` 复制进
+   `<DSH_HOME>/profiles/web/plugins/`，并在 `cordis.patch.yml` 幂等插入
+   `id: anti-repetition` 与 `id: auto-continue` 两段。Cordis 按 patch 加载 ESM
+   插件；`auto-continue` `inject: ["agents"]`，在 agent 生命周期上挂监听。
+2. **事件总线**：
+   - 硬失败链订阅回合失败（如 `agent/error`），用 `patterns` 白名单过滤可恢复错误；
+   - 软熔断链订阅 `anti-repetition/stopped`（由 anti-repetition 在流式复读/断流
+     熔断时广播）；
+   - 续跑通过 agents 服务 `followup` 代发 `continueText`，不直连上游 HTTP。
+3. **双链熔断**：硬失败计数 `attempt`（默认 ≤3）与软熔断计数 `softAttempt`
+   （默认 ≤2）独立；共用退避表与防竞争围栏（存活 / idle / 空 inbox / 运行时未关）。
+   真人 inbox 消息或删除排队中的「继续」视为否决并全量清零；任一条链到顶时同时
+   重置两条计数器。子 agent（`origin === "subagent"`）默认跳过。
+
 ```mermaid
 flowchart TD
     T["DSH agent 回合"] -->|"agent/error（硬失败）"| W{"命中 patterns 白名单？"}
@@ -204,6 +220,11 @@ node test/check.mjs         # 11/11 静态自检（需已安装的 plugins + cor
 - [cheapestinference/claude-auto-retry](https://github.com/cheapestinference/claude-auto-retry) — 失败自动重试思路来源
 - DSH 官方 `dsh-goal-round-driver` — 防竞争围栏模式参考
 
+## Contributing / Security
+
+- Contributing guide: [`CONTRIBUTING.md`](./CONTRIBUTING.md)
+- Vulnerability reporting (private): [`SECURITY.md`](./SECURITY.md)
+
 ## License
 
 MIT © 2026 dsh-auto-continue contributors
@@ -240,5 +261,11 @@ bash install/install.sh "$HOME/.dsh/data"
 Detection without args: `DSH_HOME` → `~/.dsh/data`. Restart DSH afterward.
 
 **Manual**: copy both `plugins/*.mjs` into `<DSH_HOME>/profiles/web/plugins/`, append [`examples/cordis-patch.snippet.yml`](examples/cordis-patch.snippet.yml) to `cordis.patch.yml`, restart.
+
+**Architecture (short):** plugins mount via `cordis.patch.yml`; hard failures and
+`anti-repetition/stopped` feed two independent resume chains with shared
+anti-race fences and human veto — see 工作原理 above.
+
+Contributing / security: [`CONTRIBUTING.md`](./CONTRIBUTING.md), [`SECURITY.md`](./SECURITY.md).
 
 Full config tables, guards, FAQ, and acceptance steps are in the Chinese sections above（配置参考 / 工作原理 / FAQ / 实战验收）.

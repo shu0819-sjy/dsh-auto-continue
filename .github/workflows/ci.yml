@@ -32,3 +32,6 @@ jobs:
 
       - name: Portable static suite (no DSH required)
         run: npm run test:static
+
+      - name: Mock behavior suite (stubbed @deepseek-ai/*, no DSH)
+        run: npm run test:mock

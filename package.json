@@ -12,7 +12,8 @@
     "check": "node --check plugins/auto-continue.mjs && node --check plugins/anti-repetition.mjs",
     "lint": "eslint plugins test",
     "test:static": "node test/ci-static.mjs",
-    "ci": "npm run check && npm run lint && npm run test:static"
+    "test:mock": "node test/ci-mock.mjs",
+    "ci": "npm run check && npm run lint && npm run test:static && npm run test:mock"
   },
   "devDependencies": {
     "@eslint/js": "^9.21.0",
