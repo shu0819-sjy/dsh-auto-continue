@@ -1,0 +1,22 @@
+{
+  "name": "dsh-auto-continue",
+  "version": "0.1.1",
+  "private": true,
+  "type": "module",
+  "description": "DSH plugins: auto-continue + anti-repetition dual-chain resume",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "check": "node --check plugins/auto-continue.mjs && node --check plugins/anti-repetition.mjs",
+    "lint": "eslint plugins test",
+    "test:static": "node test/ci-static.mjs",
+    "ci": "npm run check && npm run lint && npm run test:static"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.21.0",
+    "eslint": "^9.21.0",
+    "globals": "^15.15.0"
+  }
+}
