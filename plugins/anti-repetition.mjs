@@ -10,6 +10,15 @@
  * v2：熔断发生时向总线广播 `anti-repetition/stopped` 事件
  * （payload: { model, kind: "repetition"|"stream-incomplete", detector?, repeats? }），
  * 供 auto-continue 等插件做「熔断后自动续跑」；广播失败不影响熔断本身。
+ *
+ * v2.4 变更（2026-09-25，由一次真实误杀驱动）：
+ * - char-split 的「同行空格拆字」变体收紧为极端形态（默认 ≥120 个单字符 token 且占比 ≥0.6），
+ *   且思考链（strict）彻底不跑该变体、不跑破损 $ 草稿 —— 正常技术思考里单字符变量太多，
+ *   v2.3 曾把正在干活的轮次误杀成 char-split×63。
+ * - 新增 stallTimeoutSec 流式停滞看门狗：连续 N 秒无任何新 delta → 断流熔断
+ *   （kind=stream-incomplete），kldai 这类无超时上游挂死不再永远沉默。
+ * - findLineLoop 最低行长 4 → 2，补上 GO ×4 这类超短行循环漏检。
+ * - notice 文案改为「通常将自动续跑」，不再引导用户手动回「继续」。
  */
 import z from "@deepseek-ai/schemastery";
 
@@ -60,6 +69,14 @@ export const Config = z.object({
   minSingleCharLines: z.number().step(1).min(10).default(40),
   minSingleCharShare: z.number().min(0.1).max(1).default(0.3),
   minBrokenShellHits: z.number().step(1).min(3).default(8),
+  /**
+   * 同行空格拆字变体（E r r o r …）阈值：只认极端形态，避免把正常代码思考里
+   * 的单字符变量/符号误判成崩溃（v2.3 曾以 ≥40 个 + 0.3 占比误杀真实轮次）。
+   */
+  charTokMinHits: z.number().step(1).min(10).default(120),
+  charTokMinShare: z.number().min(0.1).max(1).default(0.6),
+  /** 流式停滞看门狗：连续 N 秒无任何新 delta 视为断流熔断；0 = 关闭（v2.4） */
+  stallTimeoutSec: z.number().min(0).default(120),
   /** 低多样性检测；默认关闭，易误伤正常长思考 */
   enableUniqueRatio: z.boolean().default(false),
   minUniqueRatio: z.number().min(0).max(1).default(0.12),
@@ -68,7 +85,9 @@ export const Config = z.object({
   appendNotice: z.boolean().default(true),
   noticeText: z
     .string()
-    .default("\n\n[anti-repetition: 检测到复读循环，已自动停止。回「继续」即可接着干。]"),
+    .default(
+      "\n\n[anti-repetition: 检测到复读循环，已自动停止，通常将自动续跑。若未续跑请回「继续」。]",
+    ),
   /** 是否也监控思考链；思考链跑连续/同行/归一化词干/崩溃检测，不跑密度 */
   watchReasoning: z.boolean().default(true),
   /** fetch 兜底注入（主路径是 settings samplingParams） */
@@ -122,7 +141,7 @@ function findLineLoop(tail, minLineRepeats) {
   const lines = tail.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
   if (lines.length < minLineRepeats) return null;
   const last = lines[lines.length - 1];
-  if (last.length < 4) return null;
+  if (last.length < 2) return null;
   let repeats = 1;
   for (let i = lines.length - 2; i >= 0; i--) {
     if (lines[i] !== last) break;
@@ -215,7 +234,13 @@ function findLowUniqueRatio(tail, { uniqueMinChars, minUniqueRatio }) {
  */
 function findCharSplitCollapse(
   tail,
-  { minSingleCharLines = 40, minSingleCharShare = 0.3 } = {},
+  {
+    minSingleCharLines = 40,
+    minSingleCharShare = 0.3,
+    charTokMinHits = 120,
+    charTokMinShare = 0.6,
+    strict = false,
+  } = {},
 ) {
   const rawLines = tail.split(/\r?\n/);
   const lines = rawLines.map((l) => l.trim()).filter((l) => l.length > 0);
@@ -232,15 +257,17 @@ function findCharSplitCollapse(
     }
   }
 
-  // 同行被空格拆成单字符：E r r o r A c t i o n …
+  // 同行空格拆字（E r r o r A c t i o n …）：只认极端形态——海量单字符 token 且占比极高。
+  // 思考链（strict）不跑这条：正常技术思考里单字符变量/符号很多，v2.3 曾误杀真实轮次。
+  if (strict) return null;
   const spaceTokens = tail
     .replace(/\r?\n/g, " ")
     .split(/\s+/)
     .filter(Boolean);
-  if (spaceTokens.length >= minSingleCharLines) {
+  if (spaceTokens.length >= charTokMinHits) {
     const singleTok = spaceTokens.filter((t) => Array.from(t).length === 1);
     const share = singleTok.length / spaceTokens.length;
-    if (singleTok.length >= minSingleCharLines && share >= minSingleCharShare) {
+    if (singleTok.length >= charTokMinHits && share >= charTokMinShare) {
       return {
         kind: "char-split",
         unit: `singleCharTokens=${singleTok.length}`,
@@ -295,6 +322,8 @@ export function findRepetitionLoop(text, {
   minSingleCharLines = 40,
   minSingleCharShare = 0.3,
   minBrokenShellHits = 8,
+  charTokMinHits = 120,
+  charTokMinShare = 0.6,
   enableUniqueRatio = false,
   minUniqueRatio = 0.12,
   uniqueMinChars = 200,
@@ -310,8 +339,15 @@ export function findRepetitionLoop(text, {
       ? findNormalizedStemLoop(tail, { minStemHits, minStemShare, minStemLen, maxStemLen })
       : null) ||
     (enableCollapseDetect
-      ? findCharSplitCollapse(tail, { minSingleCharLines, minSingleCharShare }) ||
-        findBrokenShellDraft(tail, { minBrokenShellHits })
+      ? findCharSplitCollapse(tail, {
+          minSingleCharLines,
+          minSingleCharShare,
+          charTokMinHits,
+          charTokMinShare,
+          strict,
+        }) ||
+        // 破损 $ 草稿只在正文跑：思考链里的 shell 片段示例容易误伤（v2.4）
+        (strict ? null : findBrokenShellDraft(tail, { minBrokenShellHits }))
       : null);
   if (hit) return hit;
   // 思考链：连续/同行/归一化词干/崩溃检测即可，密度易误伤技术长推理
@@ -360,6 +396,9 @@ async function* guardStream(source, config, onStopped) {
   let maxIndex = -1;
 
   const formatNotice = (hit) => {
+    if (hit?.kind === "stall") {
+      return `\n\n[anti-repetition: 输出停滞超过 ${hit.repeats}s 无新内容，已自动停止，通常将自动续跑。]`;
+    }
     const base = config.noticeText || "";
     if (!hit?.kind) return base;
     const detail = ` kind=${hit.kind}×${hit.repeats}`;
@@ -426,10 +465,41 @@ async function* guardStream(source, config, onStopped) {
   };
 
   try {
+    const stallMs = Number(config.stallTimeoutSec) > 0 ? Number(config.stallTimeoutSec) * 1000 : 0;
     while (true) {
-      const result = await iter.next();
-      if (result.done) break;
-      const chunk = result.value;
+      let iterResult;
+      if (stallMs > 0) {
+        // 停滞看门狗：iter.next() 与定时器赛跑，超时按断流熔断（v2.4）
+        let stallTimer = null;
+        const stallPromise = new Promise((resolve) => {
+          stallTimer = setTimeout(() => resolve({ stalled: true }), stallMs);
+        });
+        let raced;
+        try {
+          raced = await Promise.race([
+            iter.next().then((v) => ({ stalled: false, result: v })),
+            stallPromise,
+          ]);
+        } finally {
+          clearTimeout(stallTimer);
+        }
+        if (raced.stalled) {
+          const hit = {
+            kind: "stall",
+            unit: `no-delta ${config.stallTimeoutSec}s`,
+            repeats: config.stallTimeoutSec,
+          };
+          onStopped?.({ kind: "stream-incomplete", stallSeconds: config.stallTimeoutSec });
+          yield* finishAfterLoop(hit);
+          finished = true;
+          return;
+        }
+        iterResult = raced.result;
+      } else {
+        iterResult = await iter.next();
+      }
+      if (iterResult.done) break;
+      const chunk = iterResult.value;
 
       switch (chunk.type) {
         case "block-start":
@@ -495,7 +565,15 @@ async function* guardStream(source, config, onStopped) {
     }
   } finally {
     try {
-      await iter.return?.(undefined);
+      // 有界等待上游收尾：真实断流场景 iter.return() 可能永远不落定（socket 挂死），
+      // 不能让它拖住本生成器收尾；cancel 的副作用仍会发出（v2.4）
+      const returned = iter.return?.(undefined);
+      if (returned && typeof returned.then === "function") {
+        await Promise.race([
+          returned.catch(() => {}),
+          new Promise((resolve) => setTimeout(resolve, 1000)),
+        ]);
+      }
     } catch {
       /* upstream teardown */
     }
@@ -572,6 +650,6 @@ export function apply(ctx, config) {
   });
 
   ctx.logger?.info?.(
-    `anti-repetition v2: stream=${JSON.stringify(config.models)} sampling=${JSON.stringify(config.samplingModels)} minRepeats=${config.minRepeats} watchReasoning=${config.watchReasoning}`,
+    `anti-repetition v2.4: stream=${JSON.stringify(config.models)} sampling=${JSON.stringify(config.samplingModels)} minRepeats=${config.minRepeats} watchReasoning=${config.watchReasoning} stallTimeoutSec=${config.stallTimeoutSec}`,
   );
 }

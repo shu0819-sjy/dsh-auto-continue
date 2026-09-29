@@ -21,6 +21,14 @@
  * - 已核实 agent 身份解析的可靠性：agents 服务 initiator 为 AsyncLocalStorage（getStore），
  *   withInitiator 包裹整个异步 turn 生命周期，流消费期间的 currentInitiator() 恒为当前 agent，
  *   软熔断链的 agent 解析无竞态。
+ *
+ * v1.4 变更（2026-09-25）：
+ * - 新增 C 链「空停/截断续跑」：agent/turn-stopping（轮次即将正常关闭）时检查本 turn
+ *   最后一条 assistant/message —— finish=max-tokens（截断）或 finish=stop 且无任何可见
+ *   文本、无工具调用（静默空停）→ 用 agent.steer 在本轮内直接补一步续跑，不经过 idle。
+ *   连续 maxPrematureSteers 次仍空停则放行关闭（fail loud）；正常带文本收尾即清零；
+ *   interrupted（主动取消）、有工具调用（提问类交互收尾）、inbox 有排队消息时一律不插手。
+ * - B 链软续跑改发 repetitionResumeText（不再无脑回「继续」，避免喂同一失败模式）。
  */
 import z from "@deepseek-ai/schemastery";
 import { createUserMessage } from "@deepseek-ai/dsh-llm";
@@ -60,7 +68,23 @@ export const Config = z.object({
   /** 可续跑错误白名单（不区分大小写的正则，匹配错误链全文） */
   patterns: z.array(z.string()).default(DEFAULT_PATTERNS),
   /** 子 agent 失败是否也自动续跑（默认否，防与父级重试双跑） */
-  includeSubagents: z.boolean().default(false)
+  includeSubagents: z.boolean().default(false),
+  /** B 链软熔断（复读被掐/断流）续跑时改发的引导文本（v1.4）；留空回落 continueText */
+  repetitionResumeText: z.string().default(
+    "[auto-continue] 刚才的输出陷入复读/空转或中途断流，已被熔断。不要重复已输出内容，先自查卡住的原因，然后换一种更直接的方式继续完成任务：剩余工作用工具直接落地，回复只写一行进度。"
+  ),
+  /** C 链（v1.4）：轮次关闭但没有任何可见输出/被截断时，是否在本轮内 steer 续跑 */
+  watchPrematureStop: z.boolean().default(true),
+  /** C 链连续 steer 上限：超过后放行关闭等真人（fail loud） */
+  maxPrematureSteers: z.number().step(1).min(1).max(10).default(2),
+  /** C 链：静默空停（finish=stop 且无可见文本、无工具调用）的续跑引导文本 */
+  prematureResumeText: z.string().default(
+    "[auto-continue] 刚才的回复在没有任何可见输出的情况下结束了（疑似中途截断）。请继续完成任务：有未完成的工作就直接接着做；确实已完成的话，用一两句话说明结果。"
+  ),
+  /** C 链：max-tokens 截断的续跑引导文本 */
+  lengthResumeText: z.string().default(
+    "[auto-continue] 上一条回复因输出上限被截断。从中断处直接继续，不要重复已输出的内容。"
+  )
 });
 
 /** 展开错误链（message/kind/code/cause）成一段可匹配文本 */
@@ -99,13 +123,13 @@ export function apply(ctx, config) {
   const hasAgents = ctx.agents !== undefined && typeof ctx.agents.get === "function";
   if (!hasAgents) ctx.logger?.warn?.("auto-continue: agents 服务不可用，插件将以只告警模式空转");
 
-  /** @type {WeakMap<object, {failed: boolean, errorText: string, attempt: number, softStop: object|null, softAttempt: number, timer: any}>} */
+  /** @type {WeakMap<object, {failed: boolean, errorText: string, attempt: number, softStop: object|null, softAttempt: number, prematureSteers: number, timer: any}>} */
   const states = new WeakMap();
 
   function stateFor(agent) {
     let state = states.get(agent);
     if (state === undefined) {
-      state = { failed: false, errorText: "", attempt: 0, softStop: null, softAttempt: 0, timer: null };
+      state = { failed: false, errorText: "", attempt: 0, softStop: null, softAttempt: 0, prematureSteers: 0, timer: null };
       states.set(agent, state);
     }
     return state;
@@ -125,6 +149,7 @@ export function apply(ctx, config) {
     state.softStop = null;
     state.attempt = 0;
     state.softAttempt = 0;
+    state.prematureSteers = 0;
   }
 
   function isSubagent(agent) {
@@ -166,7 +191,7 @@ export function apply(ctx, config) {
     }
   }
 
-  function schedule(state, agent, attempt, reason, tag) {
+  function schedule(state, agent, attempt, reason, tag, text) {
     clearTimer(state); // 防叠加：同一 agent 任何时刻至多一个挂起定时器
     const list = config.backoffSeconds.length > 0 ? config.backoffSeconds : [5];
     const seconds = list[Math.min(attempt - 1, list.length - 1)];
@@ -177,7 +202,7 @@ export function apply(ctx, config) {
       if (inboxBlocked(agent)) return;
       try {
         agent.followup(createUserMessage({
-          content: [{ type: "text", text: config.continueText }],
+          content: [{ type: "text", text: text || config.continueText }],
           source: {
             kind: "auto-continue",
             path: tag,
@@ -284,7 +309,14 @@ export function apply(ctx, config) {
         info.kind === "stream-incomplete"
           ? "anti-repetition: 上游流未正常收尾"
           : `anti-repetition 熔断（${info.detector || info.kind}${info.repeats ? " ×" + info.repeats : ""}）`;
-      schedule(state, agent, attempt, reason, "soft");
+      const detection =
+        info.kind === "stream-incomplete"
+          ? "输出停滞/断流"
+          : `${info.detector || info.kind}${info.repeats ? " ×" + info.repeats : ""}`;
+      const resumeText = String(config.repetitionResumeText || "").trim()
+        ? `${config.repetitionResumeText}（检测：${detection}）`
+        : config.continueText;
+      schedule(state, agent, attempt, reason, "soft", resumeText);
       return;
     }
 
@@ -292,6 +324,107 @@ export function apply(ctx, config) {
     state.attempt = 0;
     state.softAttempt = 0;
   });
+
+  // ③b C 链（v1.4）：轮次即将正常关闭 —— 空停/截断检测，用 steer 在本轮内补一步
+  ctx.on("agent/turn-stopping", (payload, next) => {
+    try {
+      handleTurnStopping(payload);
+    } catch (error) {
+      ctx.logger?.warn?.(`auto-continue: turn-stopping 检查失败: ${renderError(error) || "unknown"}`);
+    }
+    return next();
+  });
+
+  const C_CHAIN_FINISH_KINDS = new Set(["stop", "max-tokens"]);
+
+  /** 读取本 turn 最后一条 assistant/message（尾部倒扫，eventAt 为 O(1) 下标访问） */
+  function lastAssistantOfTurn(agent, turn) {
+    try {
+      for (let seq = agent.session.seq - 1; seq >= 0; seq--) {
+        const event = agent.session.eventAt(seq);
+        if (!event || event.type !== "assistant/message") continue;
+        if (event.data?.turn === turn) return event;
+        if (typeof event.data?.turn === "number" && event.data.turn < turn) return undefined;
+      }
+    } catch {
+      return undefined;
+    }
+    return undefined;
+  }
+
+  /** 从紧凑流记录里取 finish reason kind */
+  function finishKindOf(event) {
+    const stream = event?.data?.stream;
+    if (!Array.isArray(stream)) return undefined;
+    for (let i = stream.length - 1; i >= 0; i--) {
+      const record = stream[i];
+      if (record?.type === "chunk" && record.chunk?.type === "finish") {
+        return record.chunk.reason?.kind;
+      }
+    }
+    return undefined;
+  }
+
+  function classifyBlocks(event) {
+    const content = event?.data?.message?.content;
+    const blocks = Array.isArray(content) ? content : [];
+    let hasText = false;
+    let hasToolCall = false;
+    for (const block of blocks) {
+      if (block?.type === "text" && String(block.text || "").trim()) hasText = true;
+      if (block?.type === "tool-call") hasToolCall = true;
+    }
+    return { hasText, hasToolCall };
+  }
+
+  function handleTurnStopping({ agent, turn }) {
+    if (!config.enabled || !config.watchPrematureStop) return;
+    if (ctx.fiber !== undefined && ctx.fiber.state !== 2) return;
+    if (!live(agent)) return;
+    if (!config.includeSubagents && isSubagent(agent)) return;
+    if (inboxBlocked(agent)) return;
+    const state = stateFor(agent);
+    const event = lastAssistantOfTurn(agent, turn);
+    if (!event) return;
+    if (event.data?.interrupted) return; // 主动取消，不插手
+    const { hasText, hasToolCall } = classifyBlocks(event);
+    if (hasToolCall) return; // 工具/交互收尾（如提问类工具），绝不插手
+    const kind = finishKindOf(event);
+    if (kind === "stop" && hasText) {
+      state.prematureSteers = 0; // 正常带文本收尾：清零
+      return;
+    }
+    if (!C_CHAIN_FINISH_KINDS.has(kind)) return; // aborted/error/tool-calls 不归 C 链管
+    const resumeText =
+      kind === "max-tokens"
+        ? (String(config.lengthResumeText || "").trim() || config.continueText)
+        : (String(config.prematureResumeText || "").trim() || config.continueText);
+    if (state.prematureSteers >= config.maxPrematureSteers) {
+      state.prematureSteers = 0;
+      ctx.logger?.warn?.(
+        `auto-continue: 连续 ${config.maxPrematureSteers} 次空停/截断续跑仍无输出，放行关闭等真人介入（finish=${kind}，turn=${turn}）`
+      );
+      return;
+    }
+    state.prematureSteers += 1;
+    try {
+      agent.steer(createUserMessage({
+        content: [{ type: "text", text: resumeText }],
+        source: {
+          kind: "auto-continue",
+          path: "premature-stop",
+          attempt: state.prematureSteers,
+          reason: `finish=${kind} turn=${turn}`
+        }
+      }));
+      ctx.logger?.info?.(
+        `auto-continue: 空停/截断续跑已 steer（finish=${kind}，第 ${state.prematureSteers} 次，turn=${turn}）`
+      );
+    } catch (error) {
+      state.prematureSteers -= 1;
+      ctx.logger?.warn?.(`auto-continue: steer 失败: ${renderError(error) || "unknown"}`);
+    }
+  }
 
   // ④ 真人插话 → 立即让位（撤定时器、清全部计数与标记）
   ctx.on("agent/inbox/inserted", ({ agent, message }) => {
@@ -307,8 +440,9 @@ export function apply(ctx, config) {
   });
 
   ctx.logger?.info?.(
-    `auto-continue v1.3: enabled=${config.enabled} maxAttempts=${config.maxAttempts} ` +
+    `auto-continue v1.4: enabled=${config.enabled} maxAttempts=${config.maxAttempts} ` +
     `soft=${config.resumeAfterRepetitionStop}/${config.maxRepetitionResumes} ` +
+    `premature=${config.watchPrematureStop}/${config.maxPrematureSteers} ` +
     `backoff=[${config.backoffSeconds.join(",")}]s includeSubagents=${config.includeSubagents} ` +
     `patterns=${regexes.length} 条 agentsService=${hasAgents}`
   );
