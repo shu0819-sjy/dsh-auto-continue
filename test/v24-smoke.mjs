@@ -9,8 +9,20 @@
  *     有工具调用不插手 / 连续到上限放行 / interrupted 不插手；
  *  5) B 链软续跑改发 repetitionResumeText。
  */
-const AR = await import("file:///D:/dsh-data/data/profiles/web/plugins/anti-repetition.mjs");
-const AC = await import("file:///D:/dsh-data/data/profiles/web/plugins/auto-continue.mjs");
+import { existsSync } from "node:fs";
+import { join } from "node:path";
+import { pathToFileURL } from "node:url";
+
+function resolvePluginUrl(filename) {
+  const pluginsDir = process.env.DSH_PLUGINS_DIR;
+  if (pluginsDir) return pathToFileURL(join(pluginsDir, filename)).href;
+  const localUrl = new URL(`../plugins/${filename}`, import.meta.url);
+  if (existsSync(localUrl)) return localUrl.href;
+  throw new Error("找不到插件目录，请设置 DSH_PLUGINS_DIR");
+}
+
+const AR = await import(resolvePluginUrl("anti-repetition.mjs"));
+const AC = await import(resolvePluginUrl("auto-continue.mjs"));
 
 const results = [];
 function check(name, cond) {
