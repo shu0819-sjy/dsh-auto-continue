@@ -28,6 +28,19 @@ jobs:
           cache: npm
       - name: Install test tooling
         run: npm ci
+      - name: Validate DSH installation paths
+        shell: pwsh
+        env:
+          DSH_HOME: ${{ inputs.dsh_home }}
+          DSH_PLUGINS_DIR: ${{ inputs.dsh_plugins_dir }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not (Test-Path -LiteralPath $env:DSH_HOME -PathType Container)) {
+            throw "DSH_HOME does not exist or is not a directory: $env:DSH_HOME"
+          }
+          if (-not (Test-Path -LiteralPath $env:DSH_PLUGINS_DIR -PathType Container)) {
+            throw "DSH_PLUGINS_DIR does not exist or is not a directory: $env:DSH_PLUGINS_DIR"
+          }
       - name: Run real Cordis integration
         shell: pwsh
         env:
