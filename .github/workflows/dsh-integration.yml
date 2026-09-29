@@ -1,0 +1,41 @@
+name: DSH integration
+
+on:
+  workflow_dispatch:
+    inputs:
+      dsh_home:
+        description: 'Installed DSH data directory on the self-hosted runner'
+        required: true
+        type: string
+      dsh_plugins_dir:
+        description: 'Installed DSH web plugins directory on the self-hosted runner'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  integration:
+    name: Real Cordis integration
+    runs-on: [self-hosted, windows, dsh]
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - name: Install test tooling
+        run: npm ci
+      - name: Run real Cordis integration
+        shell: pwsh
+        env:
+          DSH_HOME: ${{ inputs.dsh_home }}
+          DSH_PLUGINS_DIR: ${{ inputs.dsh_plugins_dir }}
+        run: npm run test:integration
+      - name: Run deployment-path smoke suite
+        shell: pwsh
+        env:
+          DSH_PLUGINS_DIR: ${{ inputs.dsh_plugins_dir }}
+        run: npm run test:v24

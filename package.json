@@ -13,6 +13,8 @@
     "lint": "eslint plugins test",
     "test:static": "node test/ci-static.mjs",
     "test:mock": "node test/ci-mock.mjs",
+    "test:integration": "node test/integration.mjs",
+    "test:v24": "node test/v24-smoke.mjs",
     "ci": "npm run check && npm run lint && npm run test:static && npm run test:mock"
   },
   "devDependencies": {

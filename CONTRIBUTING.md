@@ -21,7 +21,14 @@ Optional (needs a local DSH / `@deepseek-ai/*` resolve path):
 node test/test.mjs          # mock suite
 node test/integration.mjs   # cordis Context integration
 node test/check.mjs         # installed-profile self-check
+node test/v24-smoke.mjs     # v2.4/v1.4 deployment-path smoke checks
 ```
+
+The repository also provides a manually triggered `DSH integration` workflow.
+It runs on a self-hosted runner labelled `self-hosted`, `windows`, `dsh` and
+requires `dsh_home` plus `dsh_plugins_dir` inputs. This is the only CI lane
+that claims real Cordis integration; the normal public-runner CI stays
+portable and does not pretend to contain a DSH installation.
 
 Install scripts for a real profile:
 
