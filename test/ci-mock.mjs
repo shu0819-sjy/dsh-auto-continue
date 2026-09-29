@@ -112,6 +112,7 @@ async function main() {
       env.fail(a);
       env.idle(a);
       await env.tick();
+      env.run(a); // 续跑轮真实启动（running 释放互斥标记）
     }
     const s = sendsFor(env, "s2");
     check("T2 give up after 3 continues", s.length === 3 && s[2].msg.source.attempt === 3, `sent=${s.length}`);
@@ -199,6 +200,7 @@ async function main() {
       env.softStop(a);
       env.idle(a);
       await env.tick();
+      env.run(a); // 续跑轮真实启动（running 释放互斥标记）
     }
     env.softStop(a);
     env.idle(a);

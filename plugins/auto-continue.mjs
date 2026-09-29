@@ -1,5 +1,5 @@
 /**
- * auto-continue v1.3 — 轮次失败自动续跑（DSH 原生版，思路二次加工自
+ * auto-continue v1.5 — 轮次失败自动续跑（DSH 原生版，思路二次加工自
  * cheapestinference/claude-auto-retry + goal-round-driver 防竞争模式）。
  *
  * 两条触发链：
@@ -29,6 +29,15 @@
  *   连续 maxPrematureSteers 次仍空停则放行关闭（fail loud）；正常带文本收尾即清零；
  *   interrupted（主动取消）、有工具调用（提问类交互收尾）、inbox 有排队消息时一律不插手。
  * - B 链软续跑改发 repetitionResumeText（不再无脑回「继续」，避免喂同一失败模式）。
+ *
+ * v1.5 变更（2026-09-28，采纳外部评审 #1/#3）：
+ * - 互斥槽 resumeSent（一次性让位）：C 链 steer 成功后，紧随该收尾的 idle 上 A/B 链让位
+ *   一次并立即释放标记（失败/熔断标记保留，下一轮 idle 若仍失败自然重试）——不吞并任何
+ *   链的重试，只堵「同一收尾周期 C 链与 A/B 链各发一条续跑」的窄窗口竞态。running /
+ *   干净 idle / 真人接管三处统一撤销。C 链自身连续 steer（in-turn 补步不再触发 running）
+ *   不受互斥影响。
+ * - idle 统计行：干净收尾时若本周期有过续跑，打一行汇总（A/B/C 各几次、最后触发原因），
+ *   给 minRepeats / stallTimeoutSec 等阈值调参提供真实数据。
  */
 import z from "@deepseek-ai/schemastery";
 import { createUserMessage } from "@deepseek-ai/dsh-llm";
@@ -123,13 +132,23 @@ export function apply(ctx, config) {
   const hasAgents = ctx.agents !== undefined && typeof ctx.agents.get === "function";
   if (!hasAgents) ctx.logger?.warn?.("auto-continue: agents 服务不可用，插件将以只告警模式空转");
 
-  /** @type {WeakMap<object, {failed: boolean, errorText: string, attempt: number, softStop: object|null, softAttempt: number, prematureSteers: number, timer: any}>} */
+  /** @type {WeakMap<object, {failed: boolean, errorText: string, attempt: number, softStop: object|null, softAttempt: number, prematureSteers: number, resumeSent: boolean, stats: {a: number, b: number, c: number, last: string}, timer: any}>} */
   const states = new WeakMap();
 
   function stateFor(agent) {
     let state = states.get(agent);
     if (state === undefined) {
-      state = { failed: false, errorText: "", attempt: 0, softStop: null, softAttempt: 0, prematureSteers: 0, timer: null };
+      state = {
+        failed: false,
+        errorText: "",
+        attempt: 0,
+        softStop: null,
+        softAttempt: 0,
+        prematureSteers: 0,
+        resumeSent: false, // v1.5 互斥槽：本收尾周期已发出一条续跑（followup 或 steer）
+        stats: { a: 0, b: 0, c: 0, last: "" },
+        timer: null
+      };
       states.set(agent, state);
     }
     return state;
@@ -150,6 +169,8 @@ export function apply(ctx, config) {
     state.attempt = 0;
     state.softAttempt = 0;
     state.prematureSteers = 0;
+    state.resumeSent = false;
+    state.stats = { a: 0, b: 0, c: 0, last: "" };
   }
 
   function isSubagent(agent) {
@@ -200,6 +221,7 @@ export function apply(ctx, config) {
       if (!config.enabled || !live(agent)) return;
       if (agent.status !== "idle") return;
       if (inboxBlocked(agent)) return;
+      if (state.resumeSent) return; // v1.5 互斥：本周期已有续跑在途（如 C 链 steer）
       try {
         agent.followup(createUserMessage({
           content: [{ type: "text", text: text || config.continueText }],
@@ -210,8 +232,15 @@ export function apply(ctx, config) {
             reason: String(reason).slice(0, 300)
           }
         }));
-        if (tag === "soft") state.softAttempt = attempt;
-        else state.attempt = attempt;
+        state.resumeSent = true;
+        if (tag === "soft") {
+          state.softAttempt = attempt;
+          state.stats.b += 1;
+        } else {
+          state.attempt = attempt;
+          state.stats.a += 1;
+        }
+        state.stats.last = String(reason).slice(0, 80);
         ctx.logger?.info?.(
           `auto-continue: 已代发「${config.continueText}」（${tag === "soft" ? "软熔断" : "硬失败"} 第 ${attempt} 次，原因：${String(reason).slice(0, 120)}）`
         );
@@ -269,12 +298,20 @@ export function apply(ctx, config) {
       clearTimer(state);
       state.failed = false;
       state.softStop = null;
+      state.resumeSent = false; // 重新开跑：本收尾周期结束，互斥槽释放
       return;
     }
     if (status !== "idle") return; // 未来新增状态一律不动
 
     if (state.failed) {
       // A 链：硬失败
+      if (state.resumeSent) {
+        // v1.5 一次性让位：C 链刚在本收尾 steer 过，释放互斥但保留 failed 标记，
+        // steered 轮之后若仍失败会在下一轮 idle 自然重试（不吞并重试，只防双发）。
+        state.resumeSent = false;
+        ctx.logger?.info?.("auto-continue: 本周期已有续跑在途，硬失败链让位");
+        return;
+      }
       state.failed = false;
       state.softStop = null; // 硬失败续跑会一并接上工作，软标记让位
       if (!preflight(agent)) return;
@@ -293,6 +330,12 @@ export function apply(ctx, config) {
 
     if (state.softStop !== null) {
       // B 链：软熔断（复读被掐 / 上游断流）
+      if (state.resumeSent) {
+        // v1.5 一次性让位：C 链刚 steer 过；softStop 标记保留，让位后下一轮 idle 仍可续。
+        state.resumeSent = false;
+        ctx.logger?.info?.("auto-continue: 本周期已有续跑在途，软熔断链让位");
+        return;
+      }
       const info = state.softStop;
       state.softStop = null;
       if (!preflight(agent)) return;
@@ -320,9 +363,16 @@ export function apply(ctx, config) {
       return;
     }
 
-    // 干净收尾：两条计数都归零
+    // 干净收尾：两条计数都归零；本周期有续跑则打一行统计（v1.5）
+    if (state.stats.a || state.stats.b || state.stats.c) {
+      ctx.logger?.info?.(
+        `auto-continue: 本周期续跑统计 agent=${agent.id} 硬失败=${state.stats.a} 软熔断=${state.stats.b} 空停/截断=${state.stats.c} 最后触发=${state.stats.last || "-"}`
+      );
+    }
     state.attempt = 0;
     state.softAttempt = 0;
+    state.resumeSent = false;
+    state.stats = { a: 0, b: 0, c: 0, last: "" };
   });
 
   // ③b C 链（v1.4）：轮次即将正常关闭 —— 空停/截断检测，用 steer 在本轮内补一步
@@ -406,6 +456,8 @@ export function apply(ctx, config) {
       );
       return;
     }
+    // v1.5：C 链不做互斥检查——in-turn steer 续跑不会再次触发 running，
+    // 若在这里检查 resumeSent 会挡死 C 链自身的连续 steer；互斥在 idle 侧一次性让位实现。
     state.prematureSteers += 1;
     try {
       agent.steer(createUserMessage({
@@ -417,6 +469,9 @@ export function apply(ctx, config) {
           reason: `finish=${kind} turn=${turn}`
         }
       }));
+      state.resumeSent = true;
+      state.stats.c += 1;
+      state.stats.last = `finish=${kind} turn=${turn}`;
       ctx.logger?.info?.(
         `auto-continue: 空停/截断续跑已 steer（finish=${kind}，第 ${state.prematureSteers} 次，turn=${turn}）`
       );
@@ -440,7 +495,7 @@ export function apply(ctx, config) {
   });
 
   ctx.logger?.info?.(
-    `auto-continue v1.4: enabled=${config.enabled} maxAttempts=${config.maxAttempts} ` +
+    `auto-continue v1.5: enabled=${config.enabled} maxAttempts=${config.maxAttempts} ` +
     `soft=${config.resumeAfterRepetitionStop}/${config.maxRepetitionResumes} ` +
     `premature=${config.watchPrematureStop}/${config.maxPrematureSteers} ` +
     `backoff=[${config.backoffSeconds.join(",")}]s includeSubagents=${config.includeSubagents} ` +

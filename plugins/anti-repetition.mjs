@@ -19,6 +19,13 @@
  *   （kind=stream-incomplete），kldai 这类无超时上游挂死不再永远沉默。
  * - findLineLoop 最低行长 4 → 2，补上 GO ×4 这类超短行循环漏检。
  * - notice 文案改为「通常将自动续跑」，不再引导用户手动回「继续」。
+ *
+ * v2.5 变更（2026-09-28，采纳外部评审 #5/#6）：
+ * - fetch 惩罚注入改为 globalThis 注册表 + 引用计数：patchReload: live 热改配置会重建
+ *   插件实例，旧实例 dispose 可能晚于新实例 apply，朴素「备份-还原」会把新 wrapper 一起
+ *   冲掉导致惩罚静默失效。现在首个实例装 wrapper、末个实例卸载，wrapper 始终转发到最新
+ *   注册的 patch，install/dispose 任意交错顺序下注入都存活。
+ * - guardStream 导出：可用合成流对全部检测器 + 停滞看门狗做回归测试。
  */
 import z from "@deepseek-ai/schemastery";
 
@@ -385,7 +392,13 @@ function createDetector(config, { strict = false } = {}) {
   };
 }
 
-async function* guardStream(source, config, onStopped) {
+/**
+ * 流式守卫生成器（v2.5 导出：供测试用合成流回归全部检测器与停滞看门狗）。
+ * @param {AsyncIterable<object>} source 上游 chunk 流
+ * @param {object} config Config 形状的检测配置
+ * @param {(info: {kind: string, detector?: string, repeats?: number, stallSeconds?: number}) => void} [onStopped]
+ */
+export async function* guardStream(source, config, onStopped) {
   const textDetector = createDetector(config, { strict: false });
   // 思考链只用连续/同行：技术长文反复提同一个 API 名不是复读
   const reasoningDetector = createDetector(config, { strict: true });
@@ -580,12 +593,11 @@ async function* guardStream(source, config, onStopped) {
   }
 }
 
-function installFetchSamplingGuard(config, patterns) {
-  if (!config.injectSamplingParams) return () => {};
-  if (typeof globalThis.fetch !== "function") return () => {};
-
-  const original = globalThis.fetch.bind(globalThis);
-  globalThis.fetch = async (input, init = {}) => {
+/**
+ * 生成请求体惩罚注入 patch：返回（可能被替换的）init，供 wrapper 调用。
+ */
+function makeSamplingPatch(config, patterns) {
+  return (input, init) => {
     try {
       const method = String(init.method || "GET").toUpperCase();
       const url = typeof input === "string" ? input : input?.url || "";
@@ -618,11 +630,64 @@ function installFetchSamplingGuard(config, patterns) {
     } catch {
       /* 解析失败则原样放行 */
     }
-    return original(input, init);
+    return init;
   };
+}
 
+/**
+ * fetch 惩罚注入（v2.5：全局单例 wrapper + 引用计数，热更新安全）。
+ *
+ * patchReload: live 下热改配置会重建插件实例，install/dispose 顺序不保证
+ * （旧实例 dispose 可能晚于新实例 apply）。朴素「备份-还原」在该顺序下会把
+ * 新实例的 wrapper 一起还原掉，惩罚静默失效。改为 Symbol.for 注册表：
+ * - ref 0→1 时备份 original 并安装 wrapper；
+ * - wrapper 调用时转发到「最新注册」的 patch（reg.patch）；
+ * - ref→0 且 fetch 仍是自家 wrapper 时才还原（别人动过就不碰）。
+ * 任意 install/dispose 交错顺序下注入都存活、最终必然还原。
+ */
+const FETCH_GUARD_KEY = Symbol.for("anti-repetition.samplingGuard");
+
+function installFetchSamplingGuard(config, patterns) {
+  if (!config.injectSamplingParams) return () => {};
+  if (typeof globalThis.fetch !== "function") return () => {};
+
+  const reg = (globalThis[FETCH_GUARD_KEY] ??= {
+    original: null,
+    wrapper: null,
+    ref: 0,
+    patch: null,
+  });
+  if (reg.ref === 0) {
+    reg.original = globalThis.fetch;
+    reg.wrapper = async (input, init = {}) => {
+      const patch = reg.patch;
+      if (patch) {
+        try {
+          init = patch(input, init) ?? init;
+        } catch {
+          /* patch 失败原样放行 */
+        }
+      }
+      const original = reg.original;
+      return original
+        ? original(input, init)
+        : globalThis.fetch(input, init);
+    };
+    globalThis.fetch = reg.wrapper;
+  }
+  reg.ref += 1;
+  const myPatch = makeSamplingPatch(config, patterns);
+  reg.patch = myPatch; // 最新注册生效
   return () => {
-    if (globalThis.fetch !== original) globalThis.fetch = original;
+    if (reg.patch === myPatch) reg.patch = null;
+    reg.ref = Math.max(0, reg.ref - 1);
+    if (reg.ref === 0 && globalThis.fetch === reg.wrapper) {
+      globalThis.fetch = reg.original;
+      reg.original = null;
+      reg.wrapper = null;
+      reg.patch = null;
+      delete globalThis[FETCH_GUARD_KEY];
+    }
   };
 }
 
@@ -650,6 +715,6 @@ export function apply(ctx, config) {
   });
 
   ctx.logger?.info?.(
-    `anti-repetition v2.4: stream=${JSON.stringify(config.models)} sampling=${JSON.stringify(config.samplingModels)} minRepeats=${config.minRepeats} watchReasoning=${config.watchReasoning} stallTimeoutSec=${config.stallTimeoutSec}`,
+    `anti-repetition v2.5: stream=${JSON.stringify(config.models)} sampling=${JSON.stringify(config.samplingModels)} minRepeats=${config.minRepeats} watchReasoning=${config.watchReasoning} stallTimeoutSec=${config.stallTimeoutSec}`,
   );
 }

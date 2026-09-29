@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] — 2026-09-28
+
+外部评审「取其精华去其糟粕」：采纳 #1/#3/#5/#6，丢弃 #2/#4/#7（理由见下）。
+
+### Added — auto-continue v1.5
+
+- **互斥槽 `resumeSent`（一次性让位）**：C 链空停/截断 steer 成功后，紧随该收尾的 idle 上 A/B 链让位一次并立即释放标记；失败/熔断标记保留，下一轮 idle 若仍失败自然重试——只堵「同一收尾周期 C 链与 A/B 链各发一条续跑」的窄窗口竞态，不吞并任何链的重试。C 链自身连续 steer（in-turn 补步不再触发 running）不受互斥影响。running / 干净 idle / 真人接管三处统一撤销。
+- **idle 统计行**：干净收尾时若本周期有过续跑，打一行 `本周期续跑统计 agent=… 硬失败=N 软熔断=N 空停/截断=N 最后触发=…`，给 `minRepeats` / `stallTimeoutSec` 等阈值调参提供真实数据。
+
+### Added — anti-repetition v2.5
+
+- **fetch 惩罚注入热更新安全**：`installFetchSamplingGuard` 改为 `Symbol.for` 全局注册表 + 引用计数。`patchReload: live` 下热改配置会重建插件实例，旧实例 dispose 可能晚于新实例 apply；朴素「备份-还原」会把新 wrapper 一起冲掉导致惩罚静默失效。现在首个实例装 wrapper、末个实例卸载，wrapper 始终转发到最新注册的 patch，install/dispose 任意交错顺序下注入都存活、最终必然还原。
+- **导出 `guardStream`**：可用合成流对全部 6 类检测器 + 停滞看门狗做回归测试。
+
+### Tests
+
+- `test/v25-hardening.mjs`：25 项（互斥槽让位/释放、统计行、fetch 注入 install/dispose 交错顺序、合成流 consecutive 熔断 / 上游截断 aborted / tool-call 半截块 aborted / strict 思考链不误杀）。
+- `test/test.mjs` / `test/ci-mock.mjs`：重试循环补发 `running` 事件（模拟续跑轮真实启动），断言意图不变。
+
+### Rejected（评审建议中不采纳的部分与理由）
+
+- **#2 错误签名去重**：瞬态故障（超时/网关 5xx）的错误签名本来就是相同的——「同一签名只重试一次」会砍掉插件最核心的合法重试（真实案例：xai 瞬时 TIMEOUT 重试即恢复）；永久性故障现有设计已封顶（≤3 次 / 约 50s / fail loud warn），有界不空转。
+- **#4 默认模型启动校验**：前提不成立——防复刷的保护范围是部署配置里有意收窄的（`models` 白名单），惩罚注入按模型通配是刻意设计（penalty 不适合所有模型）；插件无法可靠得知「默认模型」，改为 README 文档提醒「换默认模型需同步 models 白名单」。
+- **#7 续跑/notice 文案收进 debug 开关**：可见性是有意设计（fail loud，用户依赖停因提示），且两段文案均可经配置自定义或清空；`repetitionResumeText` 承担引导模型换思路的功能，不能砍。
+
 ## [0.2.0] — 2026-09-25
 
 ### Added — anti-repetition v2.4

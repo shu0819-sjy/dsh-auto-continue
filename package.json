@@ -1,6 +1,6 @@
 {
   "name": "dsh-auto-continue",
-  "version": "0.1.1",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "description": "DSH plugins: auto-continue + anti-repetition dual-chain resume",
@@ -15,6 +15,7 @@
     "test:mock": "node test/ci-mock.mjs",
     "test:integration": "node test/integration.mjs",
     "test:v24": "node test/v24-smoke.mjs",
+    "test:v25": "node test/v25-hardening.mjs",
     "ci": "npm run check && npm run lint && npm run test:static && npm run test:mock"
   },
   "devDependencies": {

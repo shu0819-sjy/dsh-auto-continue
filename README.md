@@ -3,19 +3,22 @@
 [![CI](https://github.com/shu0819-sjy/dsh-auto-continue/actions/workflows/ci.yml/badge.svg)](https://github.com/shu0819-sjy/dsh-auto-continue/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 [![Node.js](https://img.shields.io/badge/node-%3E%3D18-brightgreen.svg)](https://nodejs.org/)
-[![Version](https://img.shields.io/badge/version-0.1.1-blue.svg)](./CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.3.0-blue.svg)](./CHANGELOG.md)
 
-DSH 轮次失败 / 复读熔断后自动续跑套件。包含 **auto-continue v1.3**（失败与软熔断后代发「继续」）与 **anti-repetition v2**（流式复读/断流熔断并广播事件）。MIT 许可。
+DSH 轮次失败 / 复读熔断后自动续跑套件。包含 **auto-continue v1.5**（失败与软熔断后代发「继续」）与 **anti-repetition v2.5**（流式复读/断流熔断并广播事件）。MIT 许可。
 
 ## 特性
 
 - **双链架构**：硬失败链（超时/网络/5xx 白名单）与软熔断链（anti-repetition 事件）独立计数、共用退避与防竞争围栏
+- **互斥槽（v1.5）**：C 链空停 steer 后紧随的 idle 上 A/B 链一次性让位，堵住「同一收尾周期双续跑」竞态，不吞并任何链的重试
 - **错误白名单**：仅匹配超时、网络、overload、429/5xx 等可恢复错误才续跑
 - **退避与上限**：默认 5s → 15s → 30s；硬失败 ≤3 次、软熔断 ≤2 次，到顶 fail loud
 - **防竞争围栏**：发送前复查 agent 仍存活、仍 idle、inbox 无排队、运行时未关闭（同 dsh-goal-round-driver）
 - **真人否决**：inbox 出现真人消息，或用户删除排队中的 auto-continue「继续」，立即清零计数并撤定时器
 - **子 agent 保护**：默认跳过 `origin === "subagent"`，避免与父级重试双跑
-- **测试**：25 Mock + 5 集成 + 11 静态，共 41 项
+- **可观测性（v1.5）**：干净收尾时若有续跑，打一行 A/B/C 统计汇总，给阈值调参提供数据
+- **热更新安全（v2.5）**：fetch 惩罚注入改全局引用计数，`patchReload: live` 下 install/dispose 任意交错不失效
+- **测试**：25 Mock + 5 集成 + 11 静态自检 + 44 CI 静态 + 12 CI Mock + 19 v24 冒烟 + 25 v25 加固，共 141 项
 
 ## 工作原理
 
@@ -63,6 +66,7 @@ flowchart TD
 5. UI 删除排队「继续」视为否决（v1.3）
 6. 子 agent 默认跳过
 7. 干净 idle 双链归零；任一条链到顶时同时重置两条计数器（v1.3）
+8. 互斥槽：C 链 steer 后紧随 idle 的 A/B 一次性让位；C 链自身连续 steer 不受限（v1.5）
 
 ## 安装
 
@@ -111,7 +115,7 @@ bash install/install.sh "$HOME/.dsh/data"
 
 以下键与默认值均从 `plugins/*.mjs` 的 `Config` 导出逐键核实。挂载样例见 `examples/cordis-patch.snippet.yml`。
 
-### auto-continue v1.3
+### auto-continue v1.5
 
 | 键 | 默认值 | 说明 |
 | --- | --- | --- |
@@ -123,10 +127,14 @@ bash install/install.sh "$HOME/.dsh/data"
 | `backoffSeconds` | `[5, 15, 30]` | 退避表（秒）；第 n 次取 `min(n-1, len-1)` |
 | `patterns` | 见下 | 可续跑错误白名单（不区分大小写的正则） |
 | `includeSubagents` | `false` | 子 agent 失败是否也续跑 |
+| `watchPrematureStop` | `true` | C 链：空停/截断时本轮内 steer 续跑 |
+| `maxPrematureSteers` | `2` | C 链连续 steer 上限，超过放行关闭 |
+
+v1.5 起每次干净收尾若本周期有续跑，日志输出一行 `本周期续跑统计`（硬失败/软熔断/空停各几次、最后触发原因）。
 
 默认 `patterns`：`timed out`、`timeout`、`etimedout`、`econnreset`、`econnrefused`、`econnaborted`、`epipe`、`socket hang up`、`fetch failed`、`network`、`overloaded`、`rate limit`、`\b(?:429|500|502|503|504|529)\b`。
 
-### anti-repetition v2
+### anti-repetition v2.5
 
 | 键 | 默认值 | 说明 |
 | --- | --- | --- |
@@ -150,15 +158,20 @@ bash install/install.sh "$HOME/.dsh/data"
 | `minSingleCharLines` | `40` | 单字符行数阈值 |
 | `minSingleCharShare` | `0.3` | 单字符行占比阈值 |
 | `minBrokenShellHits` | `8` | 破损 shell 草稿命中阈值 |
+| `charTokMinHits` | `120` | 同行空格拆字变体：单字符 token 数阈值（只认极端形态） |
+| `charTokMinShare` | `0.6` | 同行空格拆字变体：单字符 token 占比阈值 |
+| `stallTimeoutSec` | `120` | 流式停滞看门狗：连续 N 秒无新 delta 即断流熔断；0 = 关闭（v2.4） |
 | `enableUniqueRatio` | `false` | 低多样性检测（默认关） |
 | `minUniqueRatio` | `0.12` | 唯一字符占比下限 |
 | `uniqueMinChars` | `200` | 启用唯一比检测的最小字符数 |
 | `appendNotice` | `true` | 命中后是否追加可见提示 |
 | `noticeText` | 见源码默认 | 追加提示文案 |
 | `watchReasoning` | `true` | 是否也监控思考链 |
-| `injectSamplingParams` | `true` | fetch 兜底注入 sampling penalty |
+| `injectSamplingParams` | `true` | fetch 兜底注入 sampling penalty（v2.5 起引用计数，热改配置不失效） |
 | `frequencyPenalty` | `0.55` | frequency_penalty |
 | `presencePenalty` | `0.4` | presence_penalty |
+
+> 注意：`models` / `samplingModels` 按需收窄。更换默认模型时记得同步这两个白名单——流式检测只盯匹配的模型，换模型后若不同步，保护会静默失去作用。
 
 ## 实战验收
 
@@ -196,6 +209,9 @@ node test/ci-static.mjs
 node test/test.mjs          # 25/25 Mock（需 DSH node_modules）
 node test/integration.mjs   # 5/5 集成（需 @deepseek-ai/cordis）
 node test/check.mjs         # 11/11 静态自检（需已安装的 plugins + cordis.patch.yml）
+node test/ci-mock.mjs       # 12/12 CI Mock（resolve hook 免 DSH 依赖）
+node test/v24-smoke.mjs     # 19/19 v2.4/v1.4 冒烟（DSH_PLUGINS_DIR 指向部署副本）
+node test/v25-hardening.mjs # 25/25 v2.5/v1.5 加固：互斥槽/统计行/热改注入/合成流
 ```
 
 ## FAQ
@@ -235,9 +251,9 @@ MIT © 2026 dsh-auto-continue contributors
 
 **dsh-auto-continue** is a DeepSeek Harness plugin pair that auto-resumes a turn after recoverable failures or anti-repetition circuit breaks.
 
-- **auto-continue v1.3** — dual chains: hard failure (error whitelist + backoff, ≤3) and soft stop (`anti-repetition/stopped`, ≤2), with anti-race fences, human veto, and subagent skip by default
-- **anti-repetition v2** — streaming repetition / collapse detection; emits `anti-repetition/stopped` for soft resume
-- **Tests**: 25 mock + 5 integration + 11 static (41 total)
+- **auto-continue v1.5** — dual chains: hard failure (error whitelist + backoff, ≤3) and soft stop (`anti-repetition/stopped`, ≤2), plus a C chain (empty-stop/max-tokens steer); one-shot mutex slot prevents double resumes; per-cycle stats line on clean idle
+- **anti-repetition v2.5** — streaming repetition / collapse / stall detection; emits `anti-repetition/stopped` for soft resume; refcounted fetch penalty injection survives hot config reload
+- **Tests**: 25 mock + 5 integration + 11 check + 44 CI static + 12 CI mock + 19 v24 smoke + 25 v25 hardening (141 total)
 - **License**: MIT
 
 **Quick install (Windows)**

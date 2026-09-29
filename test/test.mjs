@@ -113,6 +113,7 @@ async function main() {
       env.fail(a);
       env.idle(a);
       await env.tick();
+      env.run(a); // 续跑轮真实启动（running 释放互斥标记）
     }
     const s = sendsFor(env, "s2");
     check("T2 连续失败 3 次到顶放弃", s.length === 3 && s[2].msg.source.attempt === 3, `实际发送 ${s.length} 次`);
@@ -126,6 +127,7 @@ async function main() {
       env.fail(a);
       env.idle(a);
       await env.tick();
+      env.run(a); // 续跑轮真实启动（running 释放互斥标记）
     }
     env.fail(a, "fetch failed");
     env.idle(a);
@@ -291,6 +293,7 @@ async function main() {
       env.softStop(a);
       env.idle(a);
       await env.tick();
+      env.run(a); // 续跑轮真实启动（running 释放互斥标记）
     }
     env.softStop(a);
     env.idle(a);
@@ -384,10 +387,12 @@ async function main() {
     env.softStop(a);
     env.idle(a);
     await env.tick(); // 软链 attempt 1
+    env.run(a); // 续跑轮真实启动（running 释放互斥标记）
     for (let i = 0; i < 4; i++) {
       env.fail(a);
       env.idle(a);
       await env.tick(); // 硬链 1/2/3 → 第 4 轮放弃并双清零
+      env.run(a); // 续跑轮真实启动（running 释放互斥标记）
     }
     env.softStop(a);
     env.idle(a);
