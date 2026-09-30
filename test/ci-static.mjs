@@ -65,7 +65,8 @@ for (const rel of ["plugins/auto-continue.mjs", "plugins/anti-repetition.mjs"]) 
   check("ac: inject agents", /export const inject = \["agents"\]/.test(src));
   check("ac: Config export", /export const Config = z\.object\(/.test(src));
   check("ac: export function apply", /export function apply\s*\(\s*ctx/.test(src));
-  check("ac: default continueText", /\.default\("继续"\)/.test(src));
+  check("ac: default continueText", /\.default\("\[auto-continue\] 上游请求失败。接着做未完成的工作，不要复述。"\)/.test(src));
+  check("ac: priorityOverQueued default true", /priorityOverQueued: z\.boolean\(\)\.default\(true\)/.test(src));
   check("ac: default maxAttempts 3", /maxAttempts:.*\.default\(3\)/.test(src));
   check(
     "ac: default maxRepetitionResumes 2",

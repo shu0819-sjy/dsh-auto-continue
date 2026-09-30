@@ -24,6 +24,8 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 function makeEnv({ backoff = [0.02, 0.02, 0.02], fiberState = 2, config = {} } = {}) {
   const handlers = new Map();
   const sent = [];
+  const prepends = []; // v1.8：inbox.prepend 插队投递
+  const woke = []; // v1.8：wakeDriver 唤醒记录
   const agents = new Map();
   const ref = { current: null };
   const ctx = {
@@ -43,9 +45,19 @@ function makeEnv({ backoff = [0.02, 0.02, 0.02], fiberState = 2, config = {} } =
       id,
       status: "idle",
       session: { header: origin ? { origin } : {} },
-      inbox: { nextTurn: [] },
+      inbox: {
+        nextTurn: [],
+        nextStep: [],
+        prepend(target, msg) {
+          agent.inbox.nextTurn.unshift(msg);
+          prepends.push({ agentId: id, target, msg });
+        },
+      },
       followup(msg) {
         sent.push({ agentId: id, msg });
+      },
+      wakeDriver() {
+        woke.push(id);
       },
     };
     agents.set(id, agent);
@@ -61,11 +73,12 @@ function makeEnv({ backoff = [0.02, 0.02, 0.02], fiberState = 2, config = {} } =
   const run = (agent) => emit("agent/status", { agent, status: "running" });
   const userMsg = (agent) =>
     emit("agent/inbox/inserted", { agent, message: { source: { kind: "user" } } });
+  const queueUser = (agent) => agent.inbox.nextTurn.push({ source: { kind: "user" } });
   const softStop = (agent, info = { kind: "repetition", detector: "consecutive", repeats: 4 }) => {
     ref.current = agent;
     emit("anti-repetition/stopped", info);
   };
-  return { sent, makeAgent, emit, fail, idle, run, userMsg, softStop, tick: () => sleep(120) };
+  return { sent, prepends, woke, makeAgent, emit, fail, idle, run, userMsg, queueUser, softStop, tick: () => sleep(120) };
 }
 
 const sendsFor = (env, id) => env.sent.filter((s) => s.agentId === id);
@@ -76,7 +89,8 @@ async function main() {
     const cfg = Config({});
     check(
       "T0 schema defaults",
-      cfg.continueText === "继续" &&
+      cfg.continueText === "[auto-continue] 上游请求失败。接着做未完成的工作，不要复述。" &&
+        cfg.priorityOverQueued === true &&
         cfg.maxAttempts === 3 &&
         cfg.maxRepetitionResumes === 2 &&
         cfg.resumeAfterRepetitionStop === true &&
@@ -98,7 +112,7 @@ async function main() {
       s.length === 1 &&
         s[0].msg.source.kind === "auto-continue" &&
         s[0].msg.source.attempt === 1 &&
-        s[0].msg.content[0].text === "继续" &&
+        s[0].msg.content[0].text === "[auto-continue] 上游请求失败。接着做未完成的工作，不要复述。" &&
         s[0].msg.source.path === "error",
       JSON.stringify(s),
     );
@@ -128,15 +142,53 @@ async function main() {
     check("T4 non-whitelist ignored", sendsFor(env, "s4").length === 0);
   }
 
-  // T5 user interrupt cancels pending continue
+  // T5a 旧模式（priorityOverQueued=false）：真人插话否决续跑
   {
-    const env = makeEnv();
-    const a = env.makeAgent("s5");
+    const env = makeEnv({ config: { priorityOverQueued: false } });
+    const a = env.makeAgent("s5a");
     env.fail(a);
     env.idle(a);
     env.userMsg(a);
     await env.tick();
-    check("T5 user interrupt wins", sendsFor(env, "s5").length === 0);
+    check("T5a old veto (priority off)", sendsFor(env, "s5a").length === 0);
+  }
+
+  // T5b v1.8 默认插队：排队消息不再否决，续跑 prepend 到队首并唤醒
+  {
+    const env = makeEnv();
+    const a = env.makeAgent("s5b");
+    env.fail(a);
+    env.idle(a);
+    env.userMsg(a);
+    env.queueUser(a);
+    await env.tick();
+    const p = env.prepends.filter((x) => x.agentId === "s5b");
+    const s = sendsFor(env, "s5b");
+    check(
+      "T5b queue-jump: prepend + wake",
+      s.length === 0 &&
+        p.length === 1 &&
+        p[0].msg.source.kind === "auto-continue" &&
+        p[0].target === "next-turn" &&
+        env.woke.includes("s5b"),
+      JSON.stringify({ sent: s.length, prepends: p.length, woke: env.woke }),
+    );
+  }
+
+  // T5c 插队顺序：续跑排在排队消息之前执行
+  {
+    const env = makeEnv();
+    const a = env.makeAgent("s5c");
+    env.fail(a);
+    env.idle(a);
+    env.queueUser(a);
+    await env.tick();
+    const order = a.inbox.nextTurn.map((m) => m?.source?.kind);
+    check(
+      "T5c continue first, queued after",
+      order[0] === "auto-continue" && order[1] === "user",
+      JSON.stringify(order),
+    );
   }
 
   // T6 subagent skipped
@@ -217,7 +269,7 @@ async function main() {
     );
   }
 
-  // T20 hard failure wins over soft when both armed
+  // T20 复读软熔断覆盖已武装的硬失败（v1.7 起语义：真复读走 B 链短续）
   {
     const env = makeEnv();
     const a = env.makeAgent("s20");
@@ -227,10 +279,21 @@ async function main() {
     await env.tick();
     const s = sendsFor(env, "s20");
     check(
-      "T20 hard path preferred",
-      s.length === 1 && s[0].msg.source.path === "error",
+      "T20 soft repetition overrides armed failure",
+      s.length === 1 && s[0].msg.source.path === "soft" && s[0].msg.source.attempt === 1,
       JSON.stringify(s.map((x) => x.msg.source.path)),
     );
+  }
+
+  // T20b 上游无输出（upstream-silent）→ 不注入续跑（v1.7 起语义）
+  {
+    const env = makeEnv();
+    const a = env.makeAgent("s20b");
+    env.fail(a);
+    env.softStop(a, { kind: "upstream-silent" });
+    env.idle(a);
+    await env.tick();
+    check("T20b upstream-silent: no inject", sendsFor(env, "s20b").length === 0);
   }
 
   // T21 soft resume disabled

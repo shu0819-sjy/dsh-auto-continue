@@ -224,8 +224,11 @@ export function apply(ctx, config) {
   /** v1.8：inbox（next-turn / next-step）里已有排队的续跑消息 → 不再叠加，防双发 */
   function inboxHasAutoContinue(agent) {
     try {
-      return agent.inbox.nextTurn.some((m) => m?.source?.kind === "auto-continue")
-        || agent.inbox.nextStep.some((m) => m?.source?.kind === "auto-continue");
+      // 逐字段容错：stub/旧运行时可能缺 nextStep；单字段异常按「不存在」处理而非整体否决
+      const turn = agent.inbox?.nextTurn;
+      const step = agent.inbox?.nextStep;
+      return (Array.isArray(turn) && turn.some((m) => m?.source?.kind === "auto-continue"))
+        || (Array.isArray(step) && step.some((m) => m?.source?.kind === "auto-continue"));
     } catch {
       return true; // 读不到 inbox 时保守跳过
     }
@@ -234,7 +237,8 @@ export function apply(ctx, config) {
   /** v1.8：next-turn 排队消息条数（读失败按 0 处理） */
   function queuedTurnCount(agent) {
     try {
-      return agent.inbox.nextTurn.length;
+      const turn = agent.inbox?.nextTurn;
+      return Array.isArray(turn) ? turn.length : 0;
     } catch {
       return 0;
     }
