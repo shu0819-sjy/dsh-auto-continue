@@ -1,5 +1,5 @@
 /**
- * auto-continue v1.5 — 轮次失败自动续跑（DSH 原生版，思路二次加工自
+ * auto-continue v1.8 — 轮次失败自动续跑（DSH 原生版，思路二次加工自
  * cheapestinference/claude-auto-retry + goal-round-driver 防竞争模式）。
  *
  * 两条触发链：
@@ -10,8 +10,10 @@
  * 加固设计：
  * 1. 错误白名单：仅超时/网络/5xx/overload 类错误才续跑，其他失败（鉴权、内容审查等）不动。
  * 2. 退避表 + 连发上限：默认 5s→15s→30s，最多 3 次；软熔断默认最多 2 次。到顶放弃并写 warn（fail loud）。
- * 3. 防竞争（goal-round-driver 同款围栏）：发送前复查 agent 仍存活、仍 idle、inbox 无排队、运行时未关闭。
- * 4. 真人接管即重置：inbox 出现真人 user 消息 → 清计数、撤挂起定时器。
+ * 3. 防竞争（goal-round-driver 同款围栏）：发送前复查 agent 仍存活、仍 idle、无重复续跑、运行时未关闭。
+ * 4. 真人否决（v1.8 收窄）：inbox 出现真人 user 消息默认不再否决（改由插队机制接手）；
+ *    用户删除排队中的 auto-continue「继续」仍然立即清零计数并撤定时器；
+ *    关闭 priorityOverQueued 时恢复旧的「真人消息即全量重置」行为。
  * 5. 子 agent 默认不碰：session.header.origin === "subagent" 的跳过，避免与父级重试打架。
  * 6. 干净收尾即重置：无失败的 idle 把两条计数都归零。
  *
@@ -38,6 +40,20 @@
  *   不受互斥影响。
  * - idle 统计行：干净收尾时若本周期有过续跑，打一行汇总（A/B/C 各几次、最后触发原因），
  *   给 minRepeats / stallTimeoutSec 等阈值调参提供真实数据。
+ *
+ * v1.6 变更（2026-09-30）：
+ * - 错误白名单补中转上游故障（kldai 等回源失败）的透传错误体：upstream request failed /
+ *   upstream service，多为瞬时 5xx 等价物。
+ *
+ * v1.8 变更（2026-09-30，用户需求「有排队消息时优先执行 continue」）：
+ * - 新增 priorityOverQueued（默认开）：inbox 有排队消息时不再否决续跑，改为把续跑消息
+ *   inbox.prepend("next-turn") 插到队首（优先于排队消息执行），再补 wakeDriver 唤醒
+ *   （idle 即启动驱动；running/maintenance 下安全空转）；无排队消息维持 followup 原路径。
+ * - A/B 链在有排队消息时跳过退避定时器、立即插队发送：退避窗口内排队消息会把驱动重新
+ *   拉起（running 处理器撤掉挂起定时器），定时器路径在该场景下必然丢失。
+ * - 排队消息不再触发真人否决（inserted 的 resetAll 仅在关闭插队时执行）。显式否决仍保留
+ *   两条路：删除排队中的 auto-continue 消息（discarded→全量清零）、关掉 priorityOverQueued。
+ * - 防叠加：next-turn / next-step 里已有 auto-continue 消息时一律跳过，不双发。
  */
 import z from "@deepseek-ai/schemastery";
 import { createUserMessage } from "@deepseek-ai/dsh-llm";
@@ -58,14 +74,17 @@ const DEFAULT_PATTERNS = [
   "network",
   "overloaded",
   "rate limit",
-  "\\b(?:429|500|502|503|504|529)\\b"
+  "\\b(?:429|500|502|503|504|529)\\b",
+  // v1.6 补：中转上游故障（kldai 等回源失败）的透传错误体，多为瞬时 5xx 等价物
+  "upstream request failed",
+  "upstream service"
 ];
 
 export const Config = z.object({
   /** 总开关 */
   enabled: z.boolean().default(true),
   /** 自动续跑时代发的文本 */
-  continueText: z.string().default("继续"),
+  continueText: z.string().default("[auto-continue] 上游请求失败。接着做未完成的工作，不要复述。"),
   /** 硬失败连发上限 */
   maxAttempts: z.number().step(1).min(1).max(10).default(3),
   /** 软熔断（复读被掐/断流）连发上限 */
@@ -78,9 +97,11 @@ export const Config = z.object({
   patterns: z.array(z.string()).default(DEFAULT_PATTERNS),
   /** 子 agent 失败是否也自动续跑（默认否，防与父级重试双跑） */
   includeSubagents: z.boolean().default(false),
+  /** v1.8：inbox 有排队消息时续跑是否插队优先执行（prepend 队首）；关闭则回到旧的「有排队即让位」 */
+  priorityOverQueued: z.boolean().default(true),
   /** B 链软熔断（复读被掐/断流）续跑时改发的引导文本（v1.4）；留空回落 continueText */
   repetitionResumeText: z.string().default(
-    "[auto-continue] 刚才的输出陷入复读/空转或中途断流，已被熔断。不要重复已输出内容，先自查卡住的原因，然后换一种更直接的方式继续完成任务：剩余工作用工具直接落地，回复只写一行进度。"
+    "[auto-continue] 复读已熔断。不要重写已有内容，剩余工作用工具落盘，回复只写一行。"
   ),
   /** C 链（v1.4）：轮次关闭但没有任何可见输出/被截断时，是否在本轮内 steer 续跑 */
   watchPrematureStop: z.boolean().default(true),
@@ -88,11 +109,11 @@ export const Config = z.object({
   maxPrematureSteers: z.number().step(1).min(1).max(10).default(2),
   /** C 链：静默空停（finish=stop 且无可见文本、无工具调用）的续跑引导文本 */
   prematureResumeText: z.string().default(
-    "[auto-continue] 刚才的回复在没有任何可见输出的情况下结束了（疑似中途截断）。请继续完成任务：有未完成的工作就直接接着做；确实已完成的话，用一两句话说明结果。"
+    "[auto-continue] 上一条没有可见结果。接着做；做完了就用一行说明。"
   ),
   /** C 链：max-tokens 截断的续跑引导文本 */
   lengthResumeText: z.string().default(
-    "[auto-continue] 上一条回复因输出上限被截断。从中断处直接继续，不要重复已输出的内容。"
+    "[auto-continue] 上一条被长度截断。从断点接着写，不要重写前面。"
   )
 });
 
@@ -200,16 +221,62 @@ export function apply(ctx, config) {
     }
   }
 
-  /** inbox 里已有真人消息或我们自己的排队续跑 → 不再插手 */
-  function inboxBlocked(agent) {
+  /** v1.8：inbox（next-turn / next-step）里已有排队的续跑消息 → 不再叠加，防双发 */
+  function inboxHasAutoContinue(agent) {
     try {
-      return agent.inbox.nextTurn.some((m) => {
-        const kind = m?.source?.kind;
-        return kind === "user" || kind === "auto-continue";
-      });
+      return agent.inbox.nextTurn.some((m) => m?.source?.kind === "auto-continue")
+        || agent.inbox.nextStep.some((m) => m?.source?.kind === "auto-continue");
     } catch {
       return true; // 读不到 inbox 时保守跳过
     }
+  }
+
+  /** v1.8：next-turn 排队消息条数（读失败按 0 处理） */
+  function queuedTurnCount(agent) {
+    try {
+      return agent.inbox.nextTurn.length;
+    } catch {
+      return 0;
+    }
+  }
+
+  /** v1.8：立即投递一条续跑。有排队消息 → prepend 插到队首（优先执行）并补唤醒；无排队 → followup 追加+唤醒 */
+  function deliverContinue(state, agent, attempt, reason, tag, text) {
+    const message = createUserMessage({
+      content: [{ type: "text", text: text || config.continueText }],
+      source: {
+        kind: "auto-continue",
+        path: tag,
+        attempt,
+        reason: String(reason).slice(0, 300)
+      }
+    });
+    const queued = queuedTurnCount(agent);
+    let via = "followup";
+    try {
+      if (config.priorityOverQueued && queued > 0) {
+        agent.inbox.prepend("next-turn", message);
+        if (typeof agent.wakeDriver === "function") agent.wakeDriver(); // idle 即唤醒；running/maintenance 下安全空转
+        via = `插队（prepend 到 ${queued} 条排队消息之前）`;
+      } else {
+        agent.followup(message);
+      }
+    } catch (error) {
+      ctx.logger?.warn?.(`auto-continue: 投递续跑失败: ${renderError(error) || "unknown"}`);
+      return;
+    }
+    state.resumeSent = true;
+    if (tag === "soft") {
+      state.softAttempt = attempt;
+      state.stats.b += 1;
+    } else {
+      state.attempt = attempt;
+      state.stats.a += 1;
+    }
+    state.stats.last = String(reason).slice(0, 80);
+    ctx.logger?.info?.(
+      `auto-continue: 已代发「${text || config.continueText}」（${tag === "soft" ? "软熔断" : "硬失败"} 第 ${attempt} 次，${via}，原因：${String(reason).slice(0, 120)}）`
+    );
   }
 
   function schedule(state, agent, attempt, reason, tag, text) {
@@ -220,33 +287,10 @@ export function apply(ctx, config) {
       state.timer = null;
       if (!config.enabled || !live(agent)) return;
       if (agent.status !== "idle") return;
-      if (inboxBlocked(agent)) return;
+      if (inboxHasAutoContinue(agent)) return; // 已有续跑排队，不叠加
+      if (!config.priorityOverQueued && queuedTurnCount(agent) > 0) return; // 旧模式：有排队消息即让位
       if (state.resumeSent) return; // v1.5 互斥：本周期已有续跑在途（如 C 链 steer）
-      try {
-        agent.followup(createUserMessage({
-          content: [{ type: "text", text: text || config.continueText }],
-          source: {
-            kind: "auto-continue",
-            path: tag,
-            attempt,
-            reason: String(reason).slice(0, 300)
-          }
-        }));
-        state.resumeSent = true;
-        if (tag === "soft") {
-          state.softAttempt = attempt;
-          state.stats.b += 1;
-        } else {
-          state.attempt = attempt;
-          state.stats.a += 1;
-        }
-        state.stats.last = String(reason).slice(0, 80);
-        ctx.logger?.info?.(
-          `auto-continue: 已代发「${config.continueText}」（${tag === "soft" ? "软熔断" : "硬失败"} 第 ${attempt} 次，原因：${String(reason).slice(0, 120)}）`
-        );
-      } catch (error) {
-        ctx.logger?.warn?.(`auto-continue: followup 失败: ${renderError(error) || "unknown"}`);
-      }
+      deliverContinue(state, agent, attempt, reason, tag, text);
     }, seconds * 1000);
   }
 
@@ -259,7 +303,8 @@ export function apply(ctx, config) {
       ctx.logger?.info?.("auto-continue: 子 agent，默认不自动续跑");
       return false;
     }
-    if (inboxBlocked(agent)) return false;
+    if (inboxHasAutoContinue(agent)) return false;
+    if (!config.priorityOverQueued && queuedTurnCount(agent) > 0) return false; // 旧模式：有排队消息即让位
     return true;
   }
 
@@ -287,7 +332,8 @@ export function apply(ctx, config) {
     state.softStop = {
       kind: info.kind || "repetition",
       detector: info.detector || "",
-      repeats: info.repeats
+      repeats: info.repeats,
+      hadOutput: info.kind === "upstream-silent" ? false : info.hadOutput !== false
     };
   });
 
@@ -302,6 +348,16 @@ export function apply(ctx, config) {
       return;
     }
     if (status !== "idle") return; // 未来新增状态一律不动
+
+    const silence = state.softStop && (state.softStop.kind === "upstream-silent" || state.softStop.hadOutput === false);
+    if (silence) {
+      state.failed = false;
+      state.softStop = null;
+      clearTimer(state);
+      ctx.logger?.info?.("auto-continue: 上游无输出，不注入续跑");
+      return;
+    }
+    if (state.softStop?.kind === "repetition" || state.softStop?.kind === "stream-incomplete") state.failed = false;
 
     if (state.failed) {
       // A 链：硬失败
@@ -322,6 +378,11 @@ export function apply(ctx, config) {
         ctx.logger?.warn?.(
           `auto-continue: 连续 ${config.maxAttempts} 次自动续跑仍失败，放弃等真人介入。最后错误：${state.errorText.slice(0, 200)}`
         );
+        return;
+      }
+      // v1.8：有排队消息时立即插队（退避定时器会被排队消息拉起的 running 撤掉，定时器路径必丢）
+      if (config.priorityOverQueued && queuedTurnCount(agent) > 0) {
+        deliverContinue(state, agent, attempt, state.errorText, "error", config.continueText);
         return;
       }
       schedule(state, agent, attempt, state.errorText, "error");
@@ -348,17 +409,17 @@ export function apply(ctx, config) {
         );
         return;
       }
-      const reason =
-        info.kind === "stream-incomplete"
-          ? "anti-repetition: 上游流未正常收尾"
-          : `anti-repetition 熔断（${info.detector || info.kind}${info.repeats ? " ×" + info.repeats : ""}）`;
-      const detection =
-        info.kind === "stream-incomplete"
-          ? "输出停滞/断流"
-          : `${info.detector || info.kind}${info.repeats ? " ×" + info.repeats : ""}`;
-      const resumeText = String(config.repetitionResumeText || "").trim()
-        ? `${config.repetitionResumeText}（检测：${detection}）`
-        : config.continueText;
+      const reason = info.kind === "stream-incomplete"
+        ? "中途断流（已有输出）"
+        : `anti-repetition 熔断（${info.detector || info.kind}${info.repeats ? " ×" + info.repeats : ""}）`;
+      const resumeText = info.kind === "stream-incomplete"
+        ? "[auto-continue] 输出中途断了。不要重写已有内容，剩余工作直接继续。"
+        : (String(config.repetitionResumeText || "").trim() || config.continueText);
+      // v1.8：有排队消息时立即插队（同 A 链：退避定时器路径在该场景必丢）
+      if (config.priorityOverQueued && queuedTurnCount(agent) > 0) {
+        deliverContinue(state, agent, attempt, reason, "soft", resumeText);
+        return;
+      }
       schedule(state, agent, attempt, reason, "soft", resumeText);
       return;
     }
@@ -375,14 +436,13 @@ export function apply(ctx, config) {
     state.stats = { a: 0, b: 0, c: 0, last: "" };
   });
 
-  // ③b C 链（v1.4）：轮次即将正常关闭 —— 空停/截断检测，用 steer 在本轮内补一步
-  ctx.on("agent/turn-stopping", (payload, next) => {
+  // ③b C 链（v1.6）：agent/turn-stopping 是 serial 派发，不传 next
+  ctx.on("agent/turn-stopping", (payload) => {
     try {
       handleTurnStopping(payload);
     } catch (error) {
       ctx.logger?.warn?.(`auto-continue: turn-stopping 检查失败: ${renderError(error) || "unknown"}`);
     }
-    return next();
   });
 
   const C_CHAIN_FINISH_KINDS = new Set(["stop", "max-tokens"]);
@@ -427,18 +487,35 @@ export function apply(ctx, config) {
     return { hasText, hasToolCall };
   }
 
+  /** 整段可见正文只有熔断/上游横幅时，不算有效回答，也不再补一轮续跑。 */
+  function isFuseOnly(event) {
+    const content = event?.data?.message?.content;
+    const blocks = Array.isArray(content) ? content : [];
+    let text = "";
+    for (const block of blocks) {
+      if (block?.type === "tool-call") return false;
+      if (block?.type === "text") text += String(block.text || "");
+    }
+    const trimmed = text.trim();
+    if (!trimmed) return false;
+    return /^\[(upstream|anti-repetition):[\s\S]*\]$/u.test(trimmed);
+  }
+
   function handleTurnStopping({ agent, turn }) {
     if (!config.enabled || !config.watchPrematureStop) return;
     if (ctx.fiber !== undefined && ctx.fiber.state !== 2) return;
     if (!live(agent)) return;
     if (!config.includeSubagents && isSubagent(agent)) return;
-    if (inboxBlocked(agent)) return;
+    if (inboxHasAutoContinue(agent)) return; // 已有续跑排队/在途，不叠加
+    if (!config.priorityOverQueued && queuedTurnCount(agent) > 0) return; // 旧模式：有排队消息即让位
     const state = stateFor(agent);
     const event = lastAssistantOfTurn(agent, turn);
     if (!event) return;
     if (event.data?.interrupted) return; // 主动取消，不插手
     const { hasText, hasToolCall } = classifyBlocks(event);
     if (hasToolCall) return; // 工具/交互收尾（如提问类工具），绝不插手
+    if (isFuseOnly(event)) return;
+    if (state.softStop && (state.softStop.kind === "upstream-silent" || state.softStop.hadOutput === false)) return;
     const kind = finishKindOf(event);
     if (kind === "stop" && hasText) {
       state.prematureSteers = 0; // 正常带文本收尾：清零
@@ -481,9 +558,10 @@ export function apply(ctx, config) {
     }
   }
 
-  // ④ 真人插话 → 立即让位（撤定时器、清全部计数与标记）
+  // ④ v1.8：真人插话默认不再否决（插队机制接手，续跑优先于排队消息）；关闭插队时恢复旧的真人接管重置
   ctx.on("agent/inbox/inserted", ({ agent, message }) => {
     if (message?.source?.kind !== "user") return;
+    if (config.priorityOverQueued) return;
     resetAll(stateFor(agent));
   });
 
@@ -495,9 +573,10 @@ export function apply(ctx, config) {
   });
 
   ctx.logger?.info?.(
-    `auto-continue v1.5: enabled=${config.enabled} maxAttempts=${config.maxAttempts} ` +
+    `auto-continue v1.8: enabled=${config.enabled} maxAttempts=${config.maxAttempts} ` +
     `soft=${config.resumeAfterRepetitionStop}/${config.maxRepetitionResumes} ` +
     `premature=${config.watchPrematureStop}/${config.maxPrematureSteers} ` +
+    `priorityOverQueued=${config.priorityOverQueued} ` +
     `backoff=[${config.backoffSeconds.join(",")}]s includeSubagents=${config.includeSubagents} ` +
     `patterns=${regexes.length} 条 agentsService=${hasAgents}`
   );

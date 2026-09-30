@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] — 2026-09-30
+
+### Added — auto-continue v1.8（live 同步 v1.6/v1.7/v1.8）
+
+- **排队消息插队续跑 `priorityOverQueued`（默认开）**：inbox 有排队消息时不再否决续跑，改为把续跑消息 `inbox.prepend("next-turn")` 插到队首（优先于排队消息执行），再补 `wakeDriver` 唤醒（idle 即启动驱动；running/maintenance 下安全空转）；无排队消息维持 `followup` 原路径。
+- **A/B 链有排队消息时跳过退避定时器、立即插队发送**：退避窗口内排队消息会把驱动重新拉起（`running` 处理器撤掉挂起定时器），定时器路径在该场景下必然丢失。
+- **真人否决收窄**：排队消息不再触发 `inserted → resetAll`（插队机制接手）；显式否决保留两条路——删除排队中的 auto-continue 消息（`discarded → 全量清零`）与关闭 `priorityOverQueued`（恢复旧的「有排队即让位」行为，C 链同步回落）。
+- **防叠加**：`next-turn` / `next-step` 里已有 auto-continue 消息时一律跳过，不双发。
+- **v1.6（此前未入档）**：错误白名单补中转上游故障透传错误体 `upstream request failed` / `upstream service`。
+
 ## [0.3.0] — 2026-09-28
 
 外部评审「取其精华去其糟粕」：采纳 #1/#3/#5/#6，丢弃 #2/#4/#7（理由见下）。
