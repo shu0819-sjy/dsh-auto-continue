@@ -80,7 +80,7 @@ for src in "${mjs_files[@]}"; do
   echo "已复制 plugins/$name  (SHA256=$src_hash)"
 done
 
-# 3) 处理 cordis.patch.yml（幂等：已有 id: auto-continue 则跳过）
+# 3) 处理 cordis.patch.yml（幂等：仅在两个插件挂载都存在时跳过）
 if [[ ! -f "$PATCH_PATH" ]]; then
   {
     printf '%s\n' "# profile patch layer — 由 dsh-auto-continue 安装脚本创建"
@@ -92,8 +92,9 @@ if [[ ! -f "$PATCH_PATH" ]]; then
   } > "$PATCH_PATH"
   echo "已创建 cordis.patch.yml 并写入 anti-repetition + auto-continue 挂载段"
 else
-  if grep -Eq '^[[:space:]]*-[[:space:]]*id:[[:space:]]*auto-continue[[:space:]]*$' "$PATCH_PATH"; then
-    echo "cordis.patch.yml 已包含 id: auto-continue — 跳过挂载段追加（幂等）"
+  if grep -Eq '^[[:space:]]*-[[:space:]]*id:[[:space:]]*auto-continue[[:space:]]*$' "$PATCH_PATH" \
+    && grep -Eq '^[[:space:]]*-[[:space:]]*id:[[:space:]]*anti-repetition[[:space:]]*$' "$PATCH_PATH"; then
+    echo "cordis.patch.yml 已包含两个插件挂载 — 跳过追加（幂等）"
   else
     # 追加前确保原文件以换行结尾，不破坏已有内容
     if [[ -s "$PATCH_PATH" ]] && [[ "$(tail -c1 "$PATCH_PATH" | wc -l)" -eq 0 ]]; then

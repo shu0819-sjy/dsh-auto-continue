@@ -108,7 +108,8 @@ async function main() {
     JSON.stringify(sent)
   );
 
-  // ⑥ 硬失败链端到端
+  // ⑥ 硬失败链端到端：模拟软续跑已真正启动，释放 v1.5 互斥槽
+  ctx.emit("agent/status", { agent, status: "running" });
   ctx.emit("agent/error", { agent, error: new Error("Request timed out.") });
   ctx.emit("agent/status", { agent, status: "idle" });
   await sleep(200);

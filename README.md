@@ -3,9 +3,9 @@
 [![CI](https://github.com/shu0819-sjy/dsh-auto-continue/actions/workflows/ci.yml/badge.svg)](https://github.com/shu0819-sjy/dsh-auto-continue/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 [![Node.js](https://img.shields.io/badge/node-%3E%3D18-brightgreen.svg)](https://nodejs.org/)
-[![Version](https://img.shields.io/badge/version-0.3.0-blue.svg)](./CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.4.0-blue.svg)](./CHANGELOG.md)
 
-DSH 轮次失败 / 复读熔断后自动续跑套件。包含 **auto-continue v1.5**（失败与软熔断后代发「继续」）与 **anti-repetition v2.5**（流式复读/断流熔断并广播事件）。MIT 许可。
+DSH 轮次失败 / 复读熔断后自动续跑套件。包含 **auto-continue v1.8**（失败、软熔断与排队优先续跑）与 **anti-repetition v2.6**（流式复读、停滞与首 token 超时防护并广播事件）。MIT 许可。
 
 ## 特性
 
@@ -14,11 +14,11 @@ DSH 轮次失败 / 复读熔断后自动续跑套件。包含 **auto-continue v1
 - **错误白名单**：仅匹配超时、网络、overload、429/5xx 等可恢复错误才续跑
 - **退避与上限**：默认 5s → 15s → 30s；硬失败 ≤3 次、软熔断 ≤2 次，到顶 fail loud
 - **防竞争围栏**：发送前复查 agent 仍存活、仍 idle、inbox 无排队、运行时未关闭（同 dsh-goal-round-driver）
-- **真人否决**：inbox 出现真人消息，或用户删除排队中的 auto-continue「继续」，立即清零计数并撤定时器
+- **人工接管**：关闭 `priorityOverQueued` 时真人消息会清零；默认开启时自动续跑插到排队消息队首；删除排队中的 auto-continue 消息仍立即清零并撤定时器
 - **子 agent 保护**：默认跳过 `origin === "subagent"`，避免与父级重试双跑
 - **可观测性（v1.5）**：干净收尾时若有续跑，打一行 A/B/C 统计汇总，给阈值调参提供数据
-- **热更新安全（v2.5）**：fetch 惩罚注入改全局引用计数，`patchReload: live` 下 install/dispose 任意交错不失效
-- **测试**：25 Mock + 5 集成 + 11 静态自检 + 44 CI 静态 + 12 CI Mock + 19 v24 冒烟 + 25 v25 加固，共 141 项
+- **热更新安全（v2.6）**：fetch 惩罚注入改全局引用计数，`patchReload: live` 下 install/dispose 任意交错不失效
+- **测试**：CI 静态 45 项 + CI Mock 16 项；另有需 DSH 私包的集成、部署副本和加固回归
 
 ## 工作原理
 
@@ -115,7 +115,7 @@ bash install/install.sh "$HOME/.dsh/data"
 
 以下键与默认值均从 `plugins/*.mjs` 的 `Config` 导出逐键核实。挂载样例见 `examples/cordis-patch.snippet.yml`。
 
-### auto-continue v1.5
+### auto-continue v1.8
 
 | 键 | 默认值 | 说明 |
 | --- | --- | --- |
@@ -127,6 +127,8 @@ bash install/install.sh "$HOME/.dsh/data"
 | `backoffSeconds` | `[5, 15, 30]` | 退避表（秒）；第 n 次取 `min(n-1, len-1)` |
 | `patterns` | 见下 | 可续跑错误白名单（不区分大小写的正则） |
 | `includeSubagents` | `false` | 子 agent 失败是否也续跑 |
+| `priorityOverQueued` | `true` | 有排队消息时将自动续跑插到队首 |
+| `repetitionResumeText` | 见源码默认 | 软熔断续跑引导文本 |
 | `watchPrematureStop` | `true` | C 链：空停/截断时本轮内 steer 续跑 |
 | `maxPrematureSteers` | `2` | C 链连续 steer 上限，超过放行关闭 |
 
@@ -134,7 +136,7 @@ v1.5 起每次干净收尾若本周期有续跑，日志输出一行 `本周期�
 
 默认 `patterns`：`timed out`、`timeout`、`etimedout`、`econnreset`、`econnrefused`、`econnaborted`、`epipe`、`socket hang up`、`fetch failed`、`network`、`overloaded`、`rate limit`、`\b(?:429|500|502|503|504|529)\b`。
 
-### anti-repetition v2.5
+### anti-repetition v2.6
 
 | 键 | 默认值 | 说明 |
 | --- | --- | --- |
@@ -160,7 +162,8 @@ v1.5 起每次干净收尾若本周期有续跑，日志输出一行 `本周期�
 | `minBrokenShellHits` | `8` | 破损 shell 草稿命中阈值 |
 | `charTokMinHits` | `120` | 同行空格拆字变体：单字符 token 数阈值（只认极端形态） |
 | `charTokMinShare` | `0.6` | 同行空格拆字变体：单字符 token 占比阈值 |
-| `stallTimeoutSec` | `120` | 流式停滞看门狗：连续 N 秒无新 delta 即断流熔断；0 = 关闭（v2.4） |
+| `stallTimeoutSec` | `120` | 首 token 后的流式停滞看门狗；连续 N 秒无新 delta 即断流熔断；0 = 关闭 |
+| `preTokenStallSec` | `240` | 首 token 前的上游沉默上限；超时返回 `EMPTY_RESPONSE` 交给硬失败链；0 = 关闭 |
 | `enableUniqueRatio` | `false` | 低多样性检测（默认关） |
 | `minUniqueRatio` | `0.12` | 唯一字符占比下限 |
 | `uniqueMinChars` | `200` | 启用唯一比检测的最小字符数 |
@@ -206,12 +209,12 @@ node test/ci-static.mjs
 在仓库根目录（通常设置 `DSH_HOME`，或依赖 `test/_dsh-env.mjs` 探测本机安装）：
 
 ```bash
-node test/test.mjs          # 25/25 Mock（需 DSH node_modules）
-node test/integration.mjs   # 5/5 集成（需 @deepseek-ai/cordis）
-node test/check.mjs         # 11/11 静态自检（需已安装的 plugins + cordis.patch.yml）
-node test/ci-mock.mjs       # 12/12 CI Mock（resolve hook 免 DSH 依赖）
-node test/v24-smoke.mjs     # 19/19 v2.4/v1.4 冒烟（DSH_PLUGINS_DIR 指向部署副本）
-node test/v25-hardening.mjs # 25/25 v2.5/v1.5 加固：互斥槽/统计行/热改注入/合成流
+node test/test.mjs          # 25/25 Mock（v1.8 契约）
+node test/integration.mjs   # 5/5 集成；需 @deepseek-ai/cordis
+node test/check.mjs         # 11/11 部署副本静态自检；DSH_HOME 指向数据目录
+node test/ci-mock.mjs       # 16/16 CI Mock；resolve hook 免 DSH 依赖
+node test/v24-smoke.mjs     # 19/19 v2.4/v1.4 冒烟；可移植 hook，DSH_PLUGINS_DIR 可指向部署副本
+node test/v25-hardening.mjs # 27/27 v2.5/v1.5 加固：互斥槽/统计行/热改注入/合成流；可移植 hook
 ```
 
 ## FAQ

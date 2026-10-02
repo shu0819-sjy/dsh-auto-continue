@@ -48,8 +48,10 @@
         injectSamplingParams: true
         frequencyPenalty: 0.55
         presencePenalty: 0.4
+         # 首 token 前的上游沉默上限；0 = 关闭
+         preTokenStallSec: 240
 
-# 失败自动续跑 v1.3：硬失败白名单退避续跑 + 软熔断（anti-repetition）后续跑
+# 失败自动续跑 v1.8：硬失败白名单退避续跑 + 软熔断（anti-repetition）后续跑
 - insert:
     - id: auto-continue
       name: ./plugins/auto-continue.mjs
@@ -68,3 +70,10 @@
         backoffSeconds: [5, 15, 30]
         # 子 agent 失败是否也续跑（默认否，防与父级双跑）
         includeSubagents: false
+         # 有排队消息时把自动续跑插到队首
+         priorityOverQueued: true
+         repetitionResumeText: "[auto-continue] 复读已熔断。不要重写已有内容，剩余工作用工具落盘，回复只写一行。"
+         watchPrematureStop: true
+         maxPrematureSteers: 2
+         prematureResumeText: "[auto-continue] 上一条没有可见结果。接着做；做完了就用一行说明。"
+         lengthResumeText: "[auto-continue] 上一条被长度截断。从断点接着写，不要重写前面。"

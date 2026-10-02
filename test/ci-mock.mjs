@@ -289,11 +289,22 @@ async function main() {
   {
     const env = makeEnv();
     const a = env.makeAgent("s20b");
-    env.fail(a);
     env.softStop(a, { kind: "upstream-silent" });
     env.idle(a);
     await env.tick();
     check("T20b upstream-silent: no inject", sendsFor(env, "s20b").length === 0);
+  }
+
+  // T20c pre-token 超时同时产生硬错误 → A 链接手一次有界续跑
+  {
+    const env = makeEnv();
+    const a = env.makeAgent("s20c");
+    env.fail(a, "upstream request timed out before first token");
+    env.softStop(a, { kind: "upstream-silent" });
+    env.idle(a);
+    await env.tick();
+    const s = sendsFor(env, "s20c");
+    check("T20c upstream-silent + hard timeout: A chain resumes", s.length === 1 && s[0].msg.source.path === "error");
   }
 
   // T21 soft resume disabled

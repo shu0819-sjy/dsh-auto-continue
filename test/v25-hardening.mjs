@@ -10,6 +10,10 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
+import { register } from "node:module";
+
+// 可移植解析：@deepseek-ai/* → 本地 stub，部署副本/仓库插件都能跑（无需 DSH 私包环境）
+register(new URL("./_ci-mock-resolve-hook.mjs", import.meta.url));
 
 function resolvePluginUrl(filename) {
   const pluginsDir = process.env.DSH_PLUGINS_DIR;
@@ -73,6 +77,33 @@ function check(name, cond) {
   check("1b 上游截断 → aborted STREAM_INCOMPLETE",
     !!fin2 && fin2.reason?.kind === "aborted" && fin2.reason?.failure?.code === "STREAM_INCOMPLETE");
   check("1b 广播 kind=stream-incomplete", stopped2[0]?.kind === "stream-incomplete");
+
+  // 1e 首 token 前停滞：清理上游迭代器后返回 EMPTY_RESPONSE error finish
+  let returnCalled = false;
+  const hungSource = {
+    [Symbol.asyncIterator]() {
+      return {
+        next() {
+          return new Promise(() => {});
+        },
+        async return() {
+          returnCalled = true;
+          return { done: true };
+        },
+      };
+    },
+  };
+  const preTokenChunks = [];
+  for await (const _chunk of AR.guardStream(hungSource, {
+    minRepeats: 3, minUnitLen: 5, maxUnitLen: 96, windowChars: 1600, minLineRepeats: 3,
+    checkEveryChars: 4, appendNotice: true, stallTimeoutSec: 0, preTokenStallSec: 0.02,
+  })) {
+    preTokenChunks.push(_chunk);
+  }
+  const preTokenFinish = preTokenChunks.find((chunk) => chunk.type === "finish");
+  check("1e 首 token 停滞返回 EMPTY_RESPONSE", preTokenFinish?.reason?.kind === "error"
+    && preTokenFinish.reason.failure?.code === "EMPTY_RESPONSE");
+  check("1e 首 token 停滞调用上游 return", returnCalled);
 
   // 1c 复读时 tool-call 块还开着 → aborted REPETITION_LOOP（半截块无法安全闭合）
   async function* repWithTool() {

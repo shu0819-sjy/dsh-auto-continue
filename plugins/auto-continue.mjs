@@ -354,11 +354,11 @@ export function apply(ctx, config) {
     if (status !== "idle") return; // 未来新增状态一律不动
 
     const silence = state.softStop && (state.softStop.kind === "upstream-silent" || state.softStop.hadOutput === false);
-    if (silence) {
+    if (silence && !state.failed) {
       state.failed = false;
       state.softStop = null;
       clearTimer(state);
-      ctx.logger?.info?.("auto-continue: 上游无输出，不注入续跑");
+      ctx.logger?.info?.("auto-continue: 只有上游无输出标记，不注入续跑");
       return;
     }
     if (state.softStop?.kind === "repetition" || state.softStop?.kind === "stream-incomplete") state.failed = false;

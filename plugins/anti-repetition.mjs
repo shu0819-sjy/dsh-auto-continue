@@ -1,5 +1,5 @@
 /**
- * glm-5.3-flash 等模型长输出短句复读循环防护。
+ * 各模型长输出短句复读循环与流式停滞防护。
  *
  * 两层：
  * 1) 可选：给匹配模型的请求体注入 frequency/presence penalty（fetch 兜底，
@@ -84,6 +84,8 @@ export const Config = z.object({
   charTokMinShare: z.number().min(0.1).max(1).default(0.6),
   /** 流式停滞看门狗：连续 N 秒无任何新 delta 视为断流熔断；0 = 关闭（v2.4） */
   stallTimeoutSec: z.number().min(0).default(120),
+  /** 首个 token 前的沉默上限；超时抛请求级错误交给 A 链 */
+  preTokenStallSec: z.number().min(0).default(240),
   /** 低多样性检测；默认关闭，易误伤正常长思考 */
   enableUniqueRatio: z.boolean().default(false),
   minUniqueRatio: z.number().min(0).max(1).default(0.12),
@@ -406,6 +408,7 @@ export async function* guardStream(source, config, onStopped) {
   const iter = source[Symbol.asyncIterator]();
   let finished = false;
   let stoppedForLoop = false;
+  let sawContent = false;
   let maxIndex = -1;
 
   const formatNotice = (hit) => {
@@ -478,8 +481,11 @@ export async function* guardStream(source, config, onStopped) {
   };
 
   try {
-    const stallMs = Number(config.stallTimeoutSec) > 0 ? Number(config.stallTimeoutSec) * 1000 : 0;
     while (true) {
+      const activeStallSec = sawContent
+        ? Number(config.stallTimeoutSec)
+        : Number(config.preTokenStallSec ?? 240);
+      const stallMs = activeStallSec > 0 ? activeStallSec * 1000 : 0;
       let iterResult;
       if (stallMs > 0) {
         // 停滞看门狗：iter.next() 与定时器赛跑，超时按断流熔断（v2.4）
@@ -497,12 +503,30 @@ export async function* guardStream(source, config, onStopped) {
           clearTimeout(stallTimer);
         }
         if (raced.stalled) {
+          if (!sawContent) {
+            const message = `upstream request timed out before first token after ${activeStallSec}s`;
+            onStopped?.({
+              kind: "upstream-silent",
+              hadOutput: false,
+              stallSeconds: activeStallSec,
+              error: message,
+            });
+            yield {
+              type: "finish",
+              reason: {
+                kind: "error",
+                failure: { message, code: "EMPTY_RESPONSE" },
+              },
+            };
+            finished = true;
+            return;
+          }
           const hit = {
             kind: "stall",
-            unit: `no-delta ${config.stallTimeoutSec}s`,
-            repeats: config.stallTimeoutSec,
+            unit: `no-delta ${activeStallSec}s`,
+            repeats: activeStallSec,
           };
-          onStopped?.({ kind: "stream-incomplete", stallSeconds: config.stallTimeoutSec });
+          onStopped?.({ kind: "stream-incomplete", stallSeconds: activeStallSec });
           yield* finishAfterLoop(hit);
           finished = true;
           return;
@@ -522,6 +546,7 @@ export async function* guardStream(source, config, onStopped) {
         case "text-delta": {
           const state = open.get(chunk.index);
           if (state) state.text += chunk.text;
+          if (chunk.text) sawContent = true;
           const hit = textDetector.push(chunk.text);
           yield chunk;
           if (hit) {
@@ -536,6 +561,7 @@ export async function* guardStream(source, config, onStopped) {
         case "reasoning-delta": {
           const state = open.get(chunk.index);
           if (state) state.text += chunk.text;
+          if (chunk.text) sawContent = true;
           yield chunk;
           if (!config.watchReasoning) continue;
           const hit = reasoningDetector.push(chunk.text);
@@ -715,6 +741,6 @@ export function apply(ctx, config) {
   });
 
   ctx.logger?.info?.(
-    `anti-repetition v2.5: stream=${JSON.stringify(config.models)} sampling=${JSON.stringify(config.samplingModels)} minRepeats=${config.minRepeats} watchReasoning=${config.watchReasoning} stallTimeoutSec=${config.stallTimeoutSec}`,
+    `anti-repetition v2.6: stream=${JSON.stringify(config.models)} sampling=${JSON.stringify(config.samplingModels)} minRepeats=${config.minRepeats} watchReasoning=${config.watchReasoning} stallTimeoutSec=${config.stallTimeoutSec} preTokenStallSec=${config.preTokenStallSec}`,
   );
 }

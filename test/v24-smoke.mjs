@@ -12,6 +12,10 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
+import { register } from "node:module";
+
+// 可移植解析：@deepseek-ai/* → 本地 stub，部署副本/仓库插件都能跑（无需 DSH 私包环境）
+register(new URL("./_ci-mock-resolve-hook.mjs", import.meta.url));
 
 function resolvePluginUrl(filename) {
   const pluginsDir = process.env.DSH_PLUGINS_DIR;

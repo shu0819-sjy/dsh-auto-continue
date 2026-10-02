@@ -87,7 +87,9 @@ async function main() {
     const cfg = Config({});
     check(
       "T0 schema 默认值",
-      cfg.continueText === "继续" && cfg.maxAttempts === 3 && cfg.maxRepetitionResumes === 2 &&
+      cfg.continueText === "[auto-continue] 上游请求失败。接着做未完成的工作，不要复述。" &&
+      cfg.priorityOverQueued === true &&
+      cfg.maxAttempts === 3 && cfg.maxRepetitionResumes === 2 &&
       cfg.resumeAfterRepetitionStop === true && Array.isArray(cfg.patterns) && cfg.patterns.length >= 12
     );
   } catch (e) {
@@ -102,7 +104,7 @@ async function main() {
     env.idle(a);
     await env.tick();
     const s = sendsFor(env, "s1");
-    check("T1 超时错误自动续跑一次", s.length === 1 && s[0].msg.source.kind === "auto-continue" && s[0].msg.source.attempt === 1 && s[0].msg.content[0].text === "继续" && s[0].msg.source.path === "error", JSON.stringify(s));
+    check("T1 超时错误自动续跑一次", s.length === 1 && s[0].msg.source.kind === "auto-continue" && s[0].msg.source.attempt === 1 && String(s[0].msg.content[0].text).includes("auto-continue") && s[0].msg.source.path === "error", JSON.stringify(s));
   }
 
   // T2 连续 4 轮失败 → 只发 3 次，第 4 轮放弃
@@ -146,15 +148,15 @@ async function main() {
     check("T4 非白名单错误不动", sendsFor(env, "s4").length === 0);
   }
 
-  // T5 真人插话撤销挂起的续跑
+  // T5 真人插话撤销挂起的续跑（v1.8：仅关闭 priorityOverQueued 时才否决；默认插队由 CI-mock T5b/T5c 覆盖）
   {
-    const env = makeEnv();
+    const env = makeEnv({ config: { priorityOverQueued: false } });
     const a = env.makeAgent("s5");
     env.fail(a);
     env.idle(a); // 定时器已挂起
     env.userMsg(a);
     await env.tick();
-    check("T5 真人插话立即让位", sendsFor(env, "s5").length === 0);
+    check("T5 真人插话立即让位（关闭插队时）", sendsFor(env, "s5").length === 0);
   }
 
   // T6 子 agent 默认不碰（硬失败链）
@@ -343,7 +345,7 @@ async function main() {
     check("T19 ECONNABORTED 命中", sendsFor(env, "s19").length === 1);
   }
 
-  // T20 硬失败与软熔断同时武装 → 硬失败优先且只发一条
+  // T20 软熔断与硬失败同时武装 → v1.8 软熔断覆盖已武装的硬失败标记，只发一条
   {
     const env = makeEnv();
     const a = env.makeAgent("s20");
@@ -352,7 +354,7 @@ async function main() {
     env.idle(a);
     await env.tick();
     const s = sendsFor(env, "s20");
-    check("T20 硬失败优先单发", s.length === 1 && s[0].msg.source.path === "error", JSON.stringify(s.map((x) => x.msg.source.path)));
+    check("T20 软熔断覆盖硬失败单发", s.length === 1 && s[0].msg.source.path === "soft", JSON.stringify(s.map((x) => x.msg.source.path)));
   }
 
   // T21 关闭软熔断续跑后不触发

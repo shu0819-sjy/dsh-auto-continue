@@ -74,7 +74,9 @@ async function main() {
     const cfg = ac.Config({});
     check(
       "S7 auto-continue schema",
-      cfg.enabled === true && cfg.continueText === "继续" && cfg.maxAttempts === 3 &&
+      cfg.enabled === true &&
+      typeof cfg.continueText === "string" && cfg.continueText.length > 0 &&
+      cfg.maxAttempts === 3 &&
       cfg.maxRepetitionResumes === 2 && cfg.resumeAfterRepetitionStop === true &&
       Array.isArray(cfg.patterns) && cfg.patterns.length >= 12
     );

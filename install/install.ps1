@@ -90,7 +90,7 @@ if ($copied.Count -eq 0) {
   throw "仓库 plugins/ 下没有 .mjs 文件"
 }
 
-# 3) 处理 cordis.patch.yml（幂等：已有 id: auto-continue 则跳过）
+# 3) 处理 cordis.patch.yml（幂等：仅在两个插件挂载都存在时跳过）
 $snippet = [System.IO.File]::ReadAllText($SnippetPath, $Utf8NoBom).TrimEnd() + "`n"
 
 if (-not (Test-Path -LiteralPath $patchPath)) {
@@ -104,8 +104,10 @@ if (-not (Test-Path -LiteralPath $patchPath)) {
 }
 else {
   $existing = [System.IO.File]::ReadAllText($patchPath, $Utf8NoBom)
-  if ($existing -match '(?m)^\s*-\s*id:\s*auto-continue\s*$') {
-    Write-Host "cordis.patch.yml 已包含 id: auto-continue — 跳过挂载段追加（幂等）"
+  $hasAutoContinue = $existing -match '(?m)^\s*-\s*id:\s*auto-continue\s*$'
+  $hasAntiRepetition = $existing -match '(?m)^\s*-\s*id:\s*anti-repetition\s*$'
+  if ($hasAutoContinue -and $hasAntiRepetition) {
+    Write-Host "cordis.patch.yml 已包含两个插件挂载 — 跳过追加（幂等）"
   }
   else {
     $sep = if ($existing.EndsWith("`n")) { "" } else { "`n" }
