@@ -125,6 +125,17 @@ for (const rel of ["plugins/auto-continue.mjs", "plugins/anti-repetition.mjs"]) 
   );
   check("patch: resumeAfterRepetitionStop", /resumeAfterRepetitionStop:\s*true/.test(patch));
   check("patch: maxAttempts", /maxAttempts:\s*\d+/.test(patch));
+  // 真实 YAML 解析（此前纯文本断言未发现示例缩进错误）。
+  const { default: yaml } = await import("yaml");
+  try {
+    const entries = yaml.parse(patch);
+    const ids = entries.flatMap((entry) => entry.insert?.map((item) => item.id) ?? []);
+    check("patch: valid YAML and unique mounts", Array.isArray(entries) &&
+      ids.filter((id) => id === "anti-repetition").length === 1 &&
+      ids.filter((id) => id === "auto-continue").length === 1);
+  } catch (e) {
+    check("patch: valid YAML and unique mounts", false, String(e));
+  }
 
   const ps1 = read("install/install.ps1");
   const sh = read("install/install.sh");

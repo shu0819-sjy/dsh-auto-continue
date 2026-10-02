@@ -43,13 +43,13 @@
         # 命中后追加可见提示；是否监控思考链
         appendNotice: true
         watchReasoning: true
-        noticeText: "\n\n[anti-repetition: 检测到复读循环，已自动停止。回「继续」即可接着干。]"
+        noticeText: "\n\n[anti-repetition: 检测到复读循环，已自动停止，通常将自动续跑。若未续跑请回「继续」。]"
         # fetch 兜底注入 sampling penalty
         injectSamplingParams: true
         frequencyPenalty: 0.55
         presencePenalty: 0.4
-         # 首 token 前的上游沉默上限；0 = 关闭
-         preTokenStallSec: 240
+        # 首 token 前的上游沉默上限；0 = 关闭
+        preTokenStallSec: 240
 
 # 失败自动续跑 v1.8：硬失败白名单退避续跑 + 软熔断（anti-repetition）后续跑
 - insert:
@@ -59,7 +59,7 @@
         # 总开关
         enabled: true
         # 自动续跑时代发的文本
-        continueText: "继续"
+        continueText: "[auto-continue] 上游请求失败。接着做未完成的工作，不要复述。"
         # 硬失败连发上限
         maxAttempts: 3
         # 软熔断连发上限
@@ -70,10 +70,10 @@
         backoffSeconds: [5, 15, 30]
         # 子 agent 失败是否也续跑（默认否，防与父级双跑）
         includeSubagents: false
-         # 有排队消息时把自动续跑插到队首
-         priorityOverQueued: true
-         repetitionResumeText: "[auto-continue] 复读已熔断。不要重写已有内容，剩余工作用工具落盘，回复只写一行。"
-         watchPrematureStop: true
-         maxPrematureSteers: 2
-         prematureResumeText: "[auto-continue] 上一条没有可见结果。接着做；做完了就用一行说明。"
-         lengthResumeText: "[auto-continue] 上一条被长度截断。从断点接着写，不要重写前面。"
+        # 有排队消息时把自动续跑插到队首
+        priorityOverQueued: true
+        repetitionResumeText: "[auto-continue] 复读已熔断。不要重写已有内容，剩余工作用工具落盘，回复只写一行。"
+        watchPrematureStop: true
+        maxPrematureSteers: 2
+        prematureResumeText: "[auto-continue] 上一条没有可见结果。接着做；做完了就用一行说明。"
+        lengthResumeText: "[auto-continue] 上一条被长度截断。从断点接着写，不要重写前面。"

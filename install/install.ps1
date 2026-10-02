@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
   安装 auto-continue + anti-repetition 到本机 DSH 数据目录。
@@ -104,15 +104,21 @@ if (-not (Test-Path -LiteralPath $patchPath)) {
 }
 else {
   $existing = [System.IO.File]::ReadAllText($patchPath, $Utf8NoBom)
-  $hasAutoContinue = $existing -match '(?m)^\s*-\s*id:\s*auto-continue\s*$'
-  $hasAntiRepetition = $existing -match '(?m)^\s*-\s*id:\s*anti-repetition\s*$'
-  if ($hasAutoContinue -and $hasAntiRepetition) {
+  $blocks = [regex]::Matches($snippet, '(?ms)^- insert:\r?\n.*?(?=^- insert:|\z)')
+  $missing = @()
+  foreach ($id in @('anti-repetition', 'auto-continue')) {
+    if ($existing -match "(?m)^\s*-\s*id:\s*$id\s*$") { continue }
+    $found = @($blocks | Where-Object { $_.Value -match "(?m)^\s*-\s*id:\s*$id\s*$" })
+    if ($found.Count -ne 1) { throw "安装示例缺少唯一的 $id 挂载段，未修改 patch" }
+    $missing += $found[0].Value.TrimEnd()
+  }
+  if ($missing.Count -eq 0) {
     Write-Host "cordis.patch.yml 已包含两个插件挂载 — 跳过追加（幂等）"
   }
   else {
-    $sep = if ($existing.EndsWith("`n")) { "" } else { "`n" }
-    Write-Utf8NoBom -Path $patchPath -Content ($existing + $sep + "`n" + $snippet)
-    Write-Host "已在 cordis.patch.yml 末尾追加 anti-repetition + auto-continue 挂载段"
+    $content = $existing.TrimEnd("`r", "`n") + "`n`n" + ($missing -join "`n`n") + "`n"
+    Write-Utf8NoBom -Path $patchPath -Content $content
+    Write-Host "已在 cordis.patch.yml 末尾补齐: $($missing.Count) 个缺失挂载段"
   }
 }
 
@@ -121,5 +127,5 @@ Write-Host "=== 安装完成 ==="
 Write-Host "重启 DSH 生效（托盘退出才算真重启）"
 Write-Host "验证方法："
 Write-Host "  1) node test/check.mjs          # 静态自检 11/11"
-Write-Host "  2) 重启后聊天发送长输出任务，失败/复读熔断时应自动出现来源 auto-continue 的「继续」"
+Write-Host "  2) 重启后聊天发送长输出任务，失败/复读熔断时应自动出现来源 auto-continue 的续跑消息"
 Write-Host "  3) 上游超时建议合并 examples/settings-retry.snippet.yml 到 settings.yaml"

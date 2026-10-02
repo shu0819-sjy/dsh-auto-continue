@@ -92,18 +92,27 @@ if [[ ! -f "$PATCH_PATH" ]]; then
   } > "$PATCH_PATH"
   echo "已创建 cordis.patch.yml 并写入 anti-repetition + auto-continue 挂载段"
 else
-  if grep -Eq '^[[:space:]]*-[[:space:]]*id:[[:space:]]*auto-continue[[:space:]]*$' "$PATCH_PATH" \
-    && grep -Eq '^[[:space:]]*-[[:space:]]*id:[[:space:]]*anti-repetition[[:space:]]*$' "$PATCH_PATH"; then
-    echo "cordis.patch.yml 已包含两个插件挂载 — 跳过追加（幂等）"
-  else
-    # 追加前确保原文件以换行结尾，不破坏已有内容
+  missing=0
+  for id in anti-repetition auto-continue; do
+    if grep -Eq "^[[:space:]]*-[[:space:]]*id:[[:space:]]*$id[[:space:]]*$" "$PATCH_PATH"; then
+      continue
+    fi
+    block="$(awk -v id="$id" '
+      /^- insert:/ { if (active) exit; start=1; block=$0 ORS; next }
+      start { block=block $0 ORS; if ($0 ~ "^[[:space:]]*-[[:space:]]*id:[[:space:]]*" id "[[:space:]]*$") active=1 }
+      END { if (active) printf "%s", block }
+    ' "$SNIPPET_PATH")"
+    [[ -n "$block" ]] || die "安装示例缺少 $id 挂载段，未修改 patch"
     if [[ -s "$PATCH_PATH" ]] && [[ "$(tail -c1 "$PATCH_PATH" | wc -l)" -eq 0 ]]; then
       printf '\n' >> "$PATCH_PATH"
     fi
-    printf '\n' >> "$PATCH_PATH"
-    cat "$SNIPPET_PATH" >> "$PATCH_PATH"
-    [[ "$(tail -c1 "$PATCH_PATH" | wc -l)" -gt 0 ]] || printf '\n' >> "$PATCH_PATH"
-    echo "已在 cordis.patch.yml 末尾追加 anti-repetition + auto-continue 挂载段"
+    printf '\n%s\n' "$block" >> "$PATCH_PATH"
+    missing=$((missing + 1))
+  done
+  if ((missing == 0)); then
+    echo "cordis.patch.yml 已包含两个插件挂载 — 跳过追加（幂等）"
+  else
+    echo "已在 cordis.patch.yml 末尾补齐 $missing 个缺失挂载段"
   fi
 fi
 
@@ -112,5 +121,5 @@ echo "=== 安装完成 ==="
 echo "重启 DSH 生效（托盘退出才算真重启）"
 echo "验证方法："
 echo "  1) node test/check.mjs          # 静态自检 11/11"
-echo "  2) 重启后聊天发送长输出任务，失败/复读熔断时应自动出现来源 auto-continue 的「继续」"
+echo "  2) 重启后聊天发送长输出任务，失败/复读熔断时应自动出现来源 auto-continue 的续跑消息"
 echo "  3) 上游超时建议合并 examples/settings-retry.snippet.yml 到 settings.yaml"

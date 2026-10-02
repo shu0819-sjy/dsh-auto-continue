@@ -13,12 +13,12 @@ DSH 轮次失败 / 复读熔断后自动续跑套件。包含 **auto-continue v1
 - **互斥槽（v1.5）**：C 链空停 steer 后紧随的 idle 上 A/B 链一次性让位，堵住「同一收尾周期双续跑」竞态，不吞并任何链的重试
 - **错误白名单**：仅匹配超时、网络、overload、429/5xx 等可恢复错误才续跑
 - **退避与上限**：默认 5s → 15s → 30s；硬失败 ≤3 次、软熔断 ≤2 次，到顶 fail loud
-- **防竞争围栏**：发送前复查 agent 仍存活、仍 idle、inbox 无排队、运行时未关闭（同 dsh-goal-round-driver）
+- **防竞争围栏**：发送前复查 agent 仍存活、仍 idle、运行时未关闭；关闭 `priorityOverQueued` 时有排队消息则让位，开启时自动续跑插队（同 dsh-goal-round-driver）
 - **人工接管**：关闭 `priorityOverQueued` 时真人消息会清零；默认开启时自动续跑插到排队消息队首；删除排队中的 auto-continue 消息仍立即清零并撤定时器
 - **子 agent 保护**：默认跳过 `origin === "subagent"`，避免与父级重试双跑
 - **可观测性（v1.5）**：干净收尾时若有续跑，打一行 A/B/C 统计汇总，给阈值调参提供数据
 - **热更新安全（v2.6）**：fetch 惩罚注入改全局引用计数，`patchReload: live` 下 install/dispose 任意交错不失效
-- **测试**：CI 静态 45 项 + CI Mock 16 项；另有需 DSH 私包的集成、部署副本和加固回归
+- **测试**：CI 静态 46 项（含示例 YAML 解析）+ CI Mock 16 项；另有需 DSH 私包的集成、部署副本和加固回归
 
 ## 工作原理
 
@@ -34,8 +34,9 @@ DSH 轮次失败 / 复读熔断后自动续跑套件。包含 **auto-continue v1
      熔断时广播）；
    - 续跑通过 agents 服务 `followup` 代发 `continueText`，不直连上游 HTTP。
 3. **双链熔断**：硬失败计数 `attempt`（默认 ≤3）与软熔断计数 `softAttempt`
-   （默认 ≤2）独立；共用退避表与防竞争围栏（存活 / idle / 空 inbox / 运行时未关）。
-   真人 inbox 消息或删除排队中的「继续」视为否决并全量清零；任一条链到顶时同时
+   （默认 ≤2）独立；共用退避表与防竞争围栏（存活 / idle / 运行时未关）。
+   默认 `priorityOverQueued: true` 时，有排队消息也让自动续跑插队；关闭该项才把真人
+   排队消息视为否决并清零。删除排队中的自动续跑消息同样视为否决。任一链到顶时
    重置两条计数器。子 agent（`origin === "subagent"`）默认跳过。
 
 ```mermaid
@@ -50,20 +51,24 @@ flowchart TD
     L2 -- "no" --> GIVE
     L1 -- "yes" --> B["退避 backoffSeconds[n]"]
     L2 -- "yes" --> B
-    B --> F{"防竞争围栏：存活 / idle / 空 inbox / 未关闭"}
-    F -- "pass" --> S["followup 代发 continueText"]
+    B --> F{"防竞争围栏：存活 / idle / 未关闭"}
+    F -- "pass" --> Q{"有排队消息？"}
+    Q -- "无" --> S["followup 代发 continueText"]
+    Q -- "有且 priorityOverQueued=true" --> P["prepend 插队续跑"]
+    Q -- "有且 priorityOverQueued=false" --> SKIP
     F -- "fail" --> SKIP
     S --> DONE["重新开跑；干净 idle 双链归零"]
-    V["真人插话 / 删排队「继续」"] -.->|"全量清零"| DONE
+    P --> DONE
+    V["关闭插队时真人插话 / 删排队自动续跑消息"] -.->|"全量清零"| DONE
 ```
 
 **护栏清单**
 
 1. 错误白名单（硬失败链）
 2. 退避表 + 连发上限（两链独立）
-3. 防竞争围栏（存活 / idle / 空 inbox / 运行时未关）
-4. 真人消息重置
-5. UI 删除排队「继续」视为否决（v1.3）
+3. 防竞争围栏（存活 / idle / 运行时未关；关闭插队时排队消息让位）
+4. 关闭插队时真人消息重置；默认插队时不重置
+5. UI 删除排队中的自动续跑消息视为否决（v1.3）
 6. 子 agent 默认跳过
 7. 干净 idle 双链归零；任一条链到顶时同时重置两条计数器（v1.3）
 8. 互斥槽：C 链 steer 后紧随 idle 的 A/B 一次性让位；C 链自身连续 steer 不受限（v1.5）
@@ -120,7 +125,7 @@ bash install/install.sh "$HOME/.dsh/data"
 | 键 | 默认值 | 说明 |
 | --- | --- | --- |
 | `enabled` | `true` | 总开关 |
-| `continueText` | `"继续"` | 自动续跑时代发的文本 |
+| `continueText` | `"[auto-continue] 上游请求失败。接着做未完成的工作，不要复述。"` | 自动续跑时代发的文本 |
 | `maxAttempts` | `3` | 硬失败连发上限（1–10） |
 | `maxRepetitionResumes` | `2` | 软熔断连发上限（1–10） |
 | `resumeAfterRepetitionStop` | `true` | 是否在 anti-repetition 熔断后自动续跑 |
@@ -189,10 +194,10 @@ v1.5 起每次干净收尾若本周期有续跑，日志输出一行 `本周期�
 1. 模型开始刷屏 `x` / 短句复读
 2. `anti-repetition` 命中 → 流停止，追加 notice（若 `appendNotice`）→ 广播 `anti-repetition/stopped`
 3. agent 进入 idle 后，`auto-continue` 按退避表等待（默认首次 5s）
-4. 防竞争复查通过 → 代发来源为 auto-continue 的「继续」（`continueText`）
+4. 防竞争复查通过 → 代发来源为 auto-continue 的续跑消息（软熔断使用 `repetitionResumeText`）
 5. 若再次熔断，软链最多再续到 `maxRepetitionResumes`（默认 2）；到顶写 warn 并放弃，等真人介入
 
-硬失败链同理：上游超时/网络错误命中 `patterns` → idle → 退避 → 代发「继续」，上限 `maxAttempts`（默认 3）。
+硬失败链同理：上游超时/网络错误命中 `patterns` → idle → 退避 → 代发 `continueText`，上限 `maxAttempts`（默认 3）。
 
 ## 测试
 
@@ -204,9 +209,9 @@ GitHub Actions 跑 `node test/ci-static.mjs`（Node 18/20/22）：语法检查 +
 node test/ci-static.mjs
 ```
 
-### 本机全量（需 DSH / `@deepseek-ai/*`）
+### 本机全量（部分需要 DSH / `@deepseek-ai/*`）
 
-在仓库根目录（通常设置 `DSH_HOME`，或依赖 `test/_dsh-env.mjs` 探测本机安装）：
+在仓库根目录运行；`test/test.mjs`、`test/integration.mjs`、`test/check.mjs` 需配置 `DSH_HOME` 指向 DSH 数据目录，其余 Mock 与 v24/v25 可使用本地 stub：
 
 ```bash
 node test/test.mjs          # 25/25 Mock（v1.8 契约）
@@ -220,7 +225,7 @@ node test/v25-hardening.mjs # 27/27 v2.5/v1.5 加固：互斥槽/统计行/热�
 ## FAQ
 
 **为什么有上限、不会死循环？**  
-硬失败与软熔断各自有连发上限（默认 3 / 2），到顶 fail loud 并写 warn；真人消息或删除排队「继续」会立即清零。干净成功的 idle 也会归零。
+硬失败与软熔断各自有连发上限（默认 3 / 2），到顶 fail loud 并写 warn；关闭插队时真人消息会清零，默认插队时不清零；删除排队中的自动续跑消息会清零。干净成功的 idle 也会归零。
 
 **错误白名单是什么？**  
 `patterns` 是一组不区分大小写的正则，匹配错误链全文。默认只覆盖超时、连接重置、network、overloaded、rate limit、429/5xx 等可恢复错误。鉴权失败、内容审查等不在名单内，不会自动续跑。
@@ -232,7 +237,7 @@ node test/v25-hardening.mjs # 27/27 v2.5/v1.5 加固：互斥槽/统计行/热�
 见上文「卸载」：删 patch 挂载段 + 插件文件 + 重启。
 
 **是否需要把 `continueText` 改成英文？**  
-不必。默认「继续」即可；英文界面可改成 `Continue` 等任意字符串，插件只代发配置值，不依赖语言。
+不必。默认是带 `[auto-continue]` 前缀的中文短句；英文界面可改成 `Continue` 等任意字符串，插件只代发配置值，不依赖语言。
 
 ## 致谢
 
@@ -254,9 +259,9 @@ MIT © 2026 dsh-auto-continue contributors
 
 **dsh-auto-continue** is a DeepSeek Harness plugin pair that auto-resumes a turn after recoverable failures or anti-repetition circuit breaks.
 
-- **auto-continue v1.5** — dual chains: hard failure (error whitelist + backoff, ≤3) and soft stop (`anti-repetition/stopped`, ≤2), plus a C chain (empty-stop/max-tokens steer); one-shot mutex slot prevents double resumes; per-cycle stats line on clean idle
-- **anti-repetition v2.5** — streaming repetition / collapse / stall detection; emits `anti-repetition/stopped` for soft resume; refcounted fetch penalty injection survives hot config reload
-- **Tests**: 25 mock + 5 integration + 11 check + 44 CI static + 12 CI mock + 19 v24 smoke + 25 v25 hardening (141 total)
+- **auto-continue v1.8** — hard failure, soft stop, and empty-stop/max-tokens steer chains; queued-message priority is configurable and enabled by default
+- **anti-repetition v2.7** — streaming repetition / collapse / stall detection; emits `anti-repetition/stopped` for soft resume; refcounted fetch penalty injection survives hot config reload
+- **Tests**: 25 mock + 5 integration + 11 deployed checks + 46 CI static + 16 CI mock + 19 v24 smoke + 27 v25 hardening (149 total)
 - **License**: MIT
 
 **Quick install (Windows)**

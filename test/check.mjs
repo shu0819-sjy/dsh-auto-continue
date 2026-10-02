@@ -89,7 +89,7 @@ async function main() {
 
   const failed = results.filter((r) => !r.ok).length;
   console.log(`\n=== 自检 ${results.length - failed}/${results.length} 通过 ===`);
-  console.log(failed === 0 ? "静态配置全部就绪；重启 DSH 后生效，出现失败/熔断时聊天里会出现来源 auto-continue 的「继续」。" : "存在未就绪项，先修复再重启。");
+  console.log(failed === 0 ? "静态配置全部就绪；重启 DSH 后生效，出现失败/熔断时聊天里会出现来源 auto-continue 的续跑消息。" : "存在未就绪项，先修复再重启。");
   process.exit(failed > 0 ? 1 : 0);
 }
 
