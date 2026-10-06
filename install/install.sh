@@ -51,16 +51,79 @@ sha256_file() {
   fi
 }
 
+assert_not_symlink() {
+  local path="$1"
+  [[ -L "$path" ]] || return 0
+  die "拒绝覆盖符号链接目标: $path"
+}
+
+assert_path_chain() {
+  local path="$1"
+  local current="/"
+  local component
+  local parts=()
+  IFS='/' read -r -a parts <<< "${path#/}"
+  for component in "${parts[@]}"; do
+    [[ -n "$component" ]] || continue
+    current="$current$component"
+    assert_not_symlink "$current"
+    current="$current/"
+  done
+}
+
+copy_atomic() {
+  local src="$1"
+  local dst="$2"
+  assert_not_symlink "$dst"
+  local tmp
+  tmp="$(mktemp "$dst.tmp.XXXXXX")"
+  if ! cp "$src" "$tmp"; then
+    rm -f "$tmp"
+    die "复制失败: $src"
+  fi
+  local src_hash dst_hash
+  src_hash="$(sha256_file "$src")"
+  dst_hash="$(sha256_file "$tmp")"
+  if [[ "$src_hash" != "$dst_hash" ]]; then
+    rm -f "$tmp"
+    die "复制校验失败: $(basename "$src") SHA256 不一致"
+  fi
+  mv -f "$tmp" "$dst"
+  echo "已复制 plugins/$(basename "$src")  (SHA256=$src_hash)"
+}
+
+write_atomic() {
+  local dst="$1"
+  local tmp
+  tmp="$(mktemp "$dst.tmp.XXXXXX")"
+  if ! cat > "$tmp"; then
+    rm -f "$tmp"
+    die "写入临时文件失败: $dst"
+  fi
+  mv -f "$tmp" "$dst"
+}
+
 DATA_DIR="$(resolve_data_dir "${1:-}")"
 WEB_DIR="$DATA_DIR/profiles/web"
 PLUGINS_DST="$WEB_DIR/plugins"
 PATCH_PATH="$WEB_DIR/cordis.patch.yml"
+LOCK_DIR="$DATA_DIR/.dsh-auto-continue.lock"
 
 echo "数据目录: $DATA_DIR"
 echo "仓库根:   $REPO_ROOT"
 
 [[ -d "$PLUGINS_SRC" ]] || die "找不到仓库 plugins/: $PLUGINS_SRC"
 [[ -f "$SNIPPET_PATH" ]] || die "找不到 examples/cordis-patch.snippet.yml: $SNIPPET_PATH"
+
+assert_path_chain "$DATA_DIR/profiles"
+assert_path_chain "$WEB_DIR"
+assert_path_chain "$PLUGINS_DST"
+assert_path_chain "$PATCH_PATH"
+
+if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+  die "检测到另一个安装进程正在运行: $LOCK_DIR"
+fi
+trap 'rm -rf "$LOCK_DIR"' EXIT
 
 # 1) 确保插件目录
 mkdir -p "$PLUGINS_DST"
@@ -73,14 +136,11 @@ mjs_files=("$PLUGINS_SRC"/*.mjs)
 for src in "${mjs_files[@]}"; do
   name="$(basename "$src")"
   dst="$PLUGINS_DST/$name"
-  cp -f "$src" "$dst"
-  src_hash="$(sha256_file "$src")"
-  dst_hash="$(sha256_file "$dst")"
-  [[ "$src_hash" == "$dst_hash" ]] || die "复制校验失败: $name SHA256 不一致"
-  echo "已复制 plugins/$name  (SHA256=$src_hash)"
+  copy_atomic "$src" "$dst"
 done
 
 # 3) 处理 cordis.patch.yml（幂等：仅在两个插件挂载都存在时跳过）
+assert_not_symlink "$PATCH_PATH"
 if [[ ! -f "$PATCH_PATH" ]]; then
   {
     printf '%s\n' "# profile patch layer — 由 dsh-auto-continue 安装脚本创建"
@@ -89,10 +149,11 @@ if [[ ! -f "$PATCH_PATH" ]]; then
     cat "$SNIPPET_PATH"
     # 确保以换行结尾
     [[ "$(tail -c1 "$SNIPPET_PATH" | wc -l)" -gt 0 ]] || printf '\n'
-  } > "$PATCH_PATH"
+  } | write_atomic "$PATCH_PATH"
   echo "已创建 cordis.patch.yml 并写入 anti-repetition + auto-continue 挂载段"
 else
   missing=0
+  missing_blocks=""
   for id in anti-repetition auto-continue; do
     if grep -Eq "^[[:space:]]*-[[:space:]]*id:[[:space:]]*$id[[:space:]]*$" "$PATCH_PATH"; then
       continue
@@ -103,15 +164,17 @@ else
       END { if (active) printf "%s", block }
     ' "$SNIPPET_PATH")"
     [[ -n "$block" ]] || die "安装示例缺少 $id 挂载段，未修改 patch"
-    if [[ -s "$PATCH_PATH" ]] && [[ "$(tail -c1 "$PATCH_PATH" | wc -l)" -eq 0 ]]; then
-      printf '\n' >> "$PATCH_PATH"
-    fi
-    printf '\n%s\n' "$block" >> "$PATCH_PATH"
+    missing_blocks+=$'\n'
+    missing_blocks+="$block"
     missing=$((missing + 1))
   done
   if ((missing == 0)); then
     echo "cordis.patch.yml 已包含两个插件挂载 — 跳过追加（幂等）"
   else
+    {
+      cat "$PATCH_PATH"
+      printf '%s\n' "$missing_blocks"
+    } | write_atomic "$PATCH_PATH"
     echo "已在 cordis.patch.yml 末尾补齐 $missing 个缺失挂载段"
   fi
 fi
